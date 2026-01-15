@@ -4,6 +4,14 @@ services:
     ports:
       - 7474:7474
       - 7687:7687
+    labels:
+      # Traefik (optional - uses Coolify's SERVICE_FQDN_NEO4J if set)
+      - "traefik.enable=true"
+      - "traefik.http.routers.neo4j.rule=Host(`${SERVICE_FQDN_NEO4J:-localhost}`)"
+      - "traefik.http.routers.neo4j.entrypoints=https"
+      - "traefik.http.routers.neo4j.tls=true"
+      - "traefik.http.routers.neo4j.tls.certresolver=letsencrypt"
+      - "traefik.http.services.neo4j.loadbalancer.server.port=7474"
     volumes:
       - ./neo4j/data:/data
       - ./neo4j/logs:/logs
