@@ -9,7 +9,9 @@ services:
       - file
       - --source=/traefik/acme.json
       - --dest=/output
-      - --domain-subdir=true
+      - --domain-subdir=false
+      - --crt-name=certificate
+      - --key-name=privatekey
       - --watch
     restart: always
 
@@ -32,7 +34,7 @@ services:
       - ./neo4j/logs:/logs
       - ./neo4j/import:/var/lib/neo4j/import
       - ./neo4j/plugins:/plugins
-      - ./neo4j/ssl/${SERVICE_FQDN_NEO4J:-localhost}:/ssl:ro
+      - ./neo4j/ssl:/ssl:ro
     environment:
       - NEO4J_AUTH=${NEO4J_AUTH}
       # TLS for Bolt using Let's Encrypt certificate
