@@ -13,13 +13,10 @@ services:
       - ./neo4j/ssl:/output
     environment:
       - DOMAIN=${SERVICE_FQDN_NEO4J:-localhost}
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - file
-      - --source=/traefik/acme.json
-      - --dest=/output
-      - --version=v2
-      - --watch
-      - --post-hook=cp /output/$DOMAIN/certificate.crt /output/certificate.pem && cp /output/$DOMAIN/privatekey.key /output/privatekey.pem
+      - |
+        traefik-certs-dumper file --source=/traefik/acme.json --dest=/output --version=v2 --watch --post-hook="cp /output/$$DOMAIN/certificate.crt /output/certificate.pem && cp /output/$$DOMAIN/privatekey.key /output/privatekey.pem"
     restart: always
 
   neo4j:
