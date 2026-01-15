@@ -11,16 +11,15 @@ services:
     volumes:
       - /data/coolify/proxy:/traefik:ro
       - ./neo4j/ssl:/output
+    environment:
+      - DOMAIN=${SERVICE_FQDN_NEO4J:-localhost}
     command:
       - file
       - --source=/traefik/acme.json
       - --dest=/output
-      - --domain-subdir=false
-      - --crt-name=certificate
-      - --key-name=privatekey
-      - --include=${SERVICE_FQDN_NEO4J:-localhost}
       - --version=v2
       - --watch
+      - --post-hook=cp /output/$DOMAIN/certificate.crt /output/certificate.pem && cp /output/$DOMAIN/privatekey.key /output/privatekey.pem
     restart: always
 
   neo4j:
