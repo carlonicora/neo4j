@@ -1,7 +1,13 @@
 name: neo4j
+networks:
+  coolify:
+    external: true
+
 services:
   certs-dumper:
     image: ldez/traefik-certs-dumper:v2.8.3
+    labels:
+      - "traefik.enable=false"
     volumes:
       - /data/coolify/proxy:/traefik:ro
       - ./neo4j/ssl:/output
@@ -12,17 +18,20 @@ services:
       - --domain-subdir=false
       - --crt-name=certificate
       - --key-name=privatekey
+      - --include=${SERVICE_FQDN_NEO4J:-localhost}
+      - --version=v2
       - --watch
     restart: always
 
   neo4j:
     depends_on:
       - certs-dumper
+    networks:
+      - coolify
     ports:
       # 7474 not exposed - access only via Traefik HTTPS
       - 7687:7687
     labels:
-      # Traefik (optional - uses Coolify's SERVICE_FQDN_NEO4J if set)
       - "traefik.enable=true"
       - "traefik.http.routers.neo4j.rule=Host(`${SERVICE_FQDN_NEO4J:-localhost}`)"
       - "traefik.http.routers.neo4j.entrypoints=https"
