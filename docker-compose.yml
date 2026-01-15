@@ -57,6 +57,7 @@ services:
       - NEO4J_dbms_ssl_policy_bolt_private__key=privatekey.pem
       - NEO4J_dbms_ssl_policy_bolt_public__certificate=certificate.pem
       - NEO4J_dbms_connector_bolt_tls__level=OPTIONAL
+      - NEO4J_dbms_ssl_policy_bolt_client__auth=NONE
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
