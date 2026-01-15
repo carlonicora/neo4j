@@ -5,7 +5,7 @@ networks:
 
 services:
   certs-dumper:
-    image: ldez/traefik-certs-dumper:v2.8.3
+    image: alpine:latest
     labels:
       - "traefik.enable=false"
     volumes:
@@ -13,10 +13,19 @@ services:
       - ./neo4j/ssl:/output
     environment:
       - DOMAIN=${SERVICE_FQDN_NEO4J:-localhost}
-    entrypoint: ["/bin/sh", "-c"]
     command:
+      - sh
+      - -c
       - |
-        traefik-certs-dumper file --source=/traefik/acme.json --dest=/output --version=v2 --watch --post-hook="cp /output/$$DOMAIN/certificate.crt /output/certificate.pem && cp /output/$$DOMAIN/privatekey.key /output/privatekey.pem"
+        apk add --no-cache jq
+        while true; do
+          if [ -f /traefik/acme.json ]; then
+            jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .certificate" /traefik/acme.json | base64 -d > /output/certificate.pem
+            jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .key" /traefik/acme.json | base64 -d > /output/privatekey.pem
+            echo "Certificates extracted for $$DOMAIN"
+          fi
+          sleep 3600
+        done
     restart: always
 
   neo4j:
