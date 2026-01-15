@@ -1,8 +1,23 @@
 name: neo4j
 services:
+  certs-dumper:
+    image: ldez/traefik-certs-dumper:v2.8.3
+    volumes:
+      - /data/coolify/proxy:/traefik:ro
+      - ./neo4j/ssl:/output
+    command:
+      - file
+      - --source=/traefik/acme.json
+      - --dest=/output
+      - --domain-subdir=true
+      - --watch
+    restart: always
+
   neo4j:
+    depends_on:
+      - certs-dumper
     ports:
-      - 7474:7474
+      # 7474 not exposed - access only via Traefik HTTPS
       - 7687:7687
     labels:
       # Traefik (optional - uses Coolify's SERVICE_FQDN_NEO4J if set)
@@ -17,8 +32,15 @@ services:
       - ./neo4j/logs:/logs
       - ./neo4j/import:/var/lib/neo4j/import
       - ./neo4j/plugins:/plugins
+      - ./neo4j/ssl/${SERVICE_FQDN_NEO4J:-localhost}:/ssl:ro
     environment:
       - NEO4J_AUTH=${NEO4J_AUTH}
+      # TLS for Bolt using Let's Encrypt certificate
+      - NEO4J_dbms_ssl_policy_bolt_enabled=true
+      - NEO4J_dbms_ssl_policy_bolt_base__directory=/ssl
+      - NEO4J_dbms_ssl_policy_bolt_private__key=privatekey.pem
+      - NEO4J_dbms_ssl_policy_bolt_public__certificate=certificate.pem
+      - NEO4J_dbms_connector_bolt_tls__level=OPTIONAL
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
