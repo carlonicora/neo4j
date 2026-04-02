@@ -9,7 +9,7 @@ services:
     labels:
       - "traefik.enable=false"
     volumes:
-      - /data/coolify/proxy:/traefik:ro
+      - ${TRAEFIK_PROXY_DIR:-./neo4j/ssl}:/traefik:ro
       - ./neo4j/ssl:/output
     environment:
       - DOMAIN=${SERVICE_FQDN_NEO4J:-localhost}
@@ -29,8 +29,6 @@ services:
     restart: always
 
   neo4j:
-    depends_on:
-      - certs-dumper
     mem_limit: 6g
     memswap_limit: 7g
     networks:
@@ -70,4 +68,26 @@ services:
       - NEO4J_server_memory_pagecache_size=1g
       - NEO4J_server_memory_off__heap_max__size=256m
     image: graphstack/dozerdb:5.26.3.0
+    restart: always
+
+  neo4j-backup:
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/localtime:/etc/localtime:ro
+      - ./neo4j/data:/data:ro
+      - ./data-backup:/backups
+    environment:
+      - COMPOSE_PROJECT=neo4j
+      - NEO4J_SERVICE=neo4j
+      - NEO4J_CONTAINER=${NEO4J_CONTAINER:-}
+      - HOST_DATA_DIR=${HOST_DATA_DIR:-}
+      - HOST_BACKUP_DIR=${HOST_BACKUP_DIR:-}
+      - S3_BUCKET=${S3_BUCKET:-}
+      - S3_ENDPOINT=${S3_ENDPOINT:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
     restart: always

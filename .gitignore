@@ -4,6 +4,9 @@ data
 import
 data-backup
 
+# Local overrides
+docker-compose.override.yml
+
 # Environment variables
 .env
 
