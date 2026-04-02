@@ -12,7 +12,16 @@ TODAY=$(date +%Y-%m-%d)
 LOG_PREFIX="[backup][${TODAY}]"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-neo4j}"
 NEO4J_SERVICE="${NEO4J_SERVICE:-neo4j}"
-CONTAINER="${BACKUP_NEO4J_CONTAINER:-${COMPOSE_PROJECT}-${NEO4J_SERVICE}-1}"
+if [ -n "${BACKUP_NEO4J_CONTAINER:-}" ]; then
+  CONTAINER="${BACKUP_NEO4J_CONTAINER}"
+else
+  # Auto-discover: find a running container whose name starts with the service
+  # name but is NOT the backup container
+  CONTAINER=$(docker ps --format '{{.Names}}' | grep "^${NEO4J_SERVICE}" | grep -v backup | head -1)
+  if [ -z "${CONTAINER}" ]; then
+    CONTAINER="${COMPOSE_PROJECT}-${NEO4J_SERVICE}-1"
+  fi
+fi
 DATA_DIR="/data"
 BACKUP_DIR="/backups/${TODAY}"
 HOST_DATA_DIR="${HOST_DATA_DIR:-}"

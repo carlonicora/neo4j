@@ -16,7 +16,14 @@ echo "Manual trigger: docker exec <container> /usr/local/bin/backup.sh"
 (
   COMPOSE_PROJECT="${COMPOSE_PROJECT:-neo4j}"
   NEO4J_SERVICE="${NEO4J_SERVICE:-neo4j}"
-  CONTAINER="${BACKUP_NEO4J_CONTAINER:-${COMPOSE_PROJECT}-${NEO4J_SERVICE}-1}"
+  if [ -n "${BACKUP_NEO4J_CONTAINER:-}" ]; then
+    CONTAINER="${BACKUP_NEO4J_CONTAINER}"
+  else
+    CONTAINER=$(docker ps --format '{{.Names}}' | grep "^${NEO4J_SERVICE}" | grep -v backup | head -1)
+    if [ -z "${CONTAINER}" ]; then
+      CONTAINER="${COMPOSE_PROJECT}-${NEO4J_SERVICE}-1"
+    fi
+  fi
 
   while true; do
     sleep 300
