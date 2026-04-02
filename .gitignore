@@ -3,6 +3,7 @@ logs
 data
 import
 data-backup
+ssl
 
 # Local overrides
 docker-compose.override.yml
