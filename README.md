@@ -28,7 +28,7 @@ Set these additional variables in the Coolify environment:
 
 ```env
 TRAEFIK_PROXY_DIR=/data/coolify/proxy
-NEO4J_CONTAINER=<actual-container-name>
+BACKUP_NEO4J_CONTAINER=<actual-container-name>
 HOST_DATA_DIR=/data/coolify/applications/<app-id>/neo4j/data
 HOST_BACKUP_DIR=/data/coolify/applications/<app-id>/data-backup
 ```
@@ -47,9 +47,9 @@ HOST_BACKUP_DIR=/data/coolify/applications/<app-id>/data-backup
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `TRAEFIK_PROXY_DIR` | Host path to Traefik proxy dir (default: `./neo4j/ssl` — no-op locally) | For Coolify |
-| `NEO4J_CONTAINER` | Exact Neo4j container name (overrides derived name) | For Coolify |
+| `BACKUP_NEO4J_CONTAINER` | Exact Neo4j container name (overrides derived name) | For Coolify |
 
-> **Coolify note:** Coolify generates container names like `neo4j-ogw8o0k8c0c0cww0w0w04wgs-141716273331` instead of the standard `neo4j-neo4j-1`. You **must** set `NEO4J_CONTAINER` to the actual container name. Find it with: `docker ps --format "{{.Names}}" | grep neo4j`
+> **Coolify note:** Coolify generates container names like `neo4j-ogw8o0k8c0c0cww0w0w04wgs-141716273331` instead of the standard `neo4j-neo4j-1`. You **must** set `BACKUP_NEO4J_CONTAINER` to the actual container name. Find it with: `docker ps --format "{{.Names}}" | grep neo4j`
 
 ### Backup Variables
 

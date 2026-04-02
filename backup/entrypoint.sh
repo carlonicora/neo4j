@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Export environment variables to a file so cron jobs can source them
 # (cron does not inherit the container's environment)
-env | grep -E '^(AWS_|S3_|HOST_|COMPOSE_|NEO4J_|DOCKER_HOST)' > /etc/environment.backup || true
+env | grep -E '^(AWS_|S3_|HOST_|COMPOSE_|BACKUP_|DOCKER_HOST)' > /etc/environment.backup || true
 
 # Create cron job - run at 2:00 AM daily
 echo "0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1" > /etc/crontabs/root
@@ -16,7 +16,7 @@ echo "Manual trigger: docker exec <container> /usr/local/bin/backup.sh"
 (
   COMPOSE_PROJECT="${COMPOSE_PROJECT:-neo4j}"
   NEO4J_SERVICE="${NEO4J_SERVICE:-neo4j}"
-  CONTAINER="${NEO4J_CONTAINER:-${COMPOSE_PROJECT}-${NEO4J_SERVICE}-1}"
+  CONTAINER="${BACKUP_NEO4J_CONTAINER:-${COMPOSE_PROJECT}-${NEO4J_SERVICE}-1}"
 
   while true; do
     sleep 300
