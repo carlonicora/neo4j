@@ -5,12 +5,13 @@ networks:
 
 services:
   certs-dumper:
-    image: alpine:latest
+    image: docker:27-cli
     labels:
       - "traefik.enable=false"
     volumes:
       - ${TRAEFIK_PROXY_DIR:-./neo4j/ssl}:/traefik:ro
       - ./neo4j/ssl:/output
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DOMAIN=${SERVICE_FQDN_NEO4J:-localhost}
     healthcheck:
@@ -24,21 +25,47 @@ services:
       - -c
       - |
         apk add --no-cache jq openssl
-        # Generate self-signed placeholder certs so Neo4j can start before Traefik is ready
-        if [ ! -f /output/privatekey.pem ] || [ ! -f /output/certificate.pem ]; then
-          echo "Generating self-signed placeholder certificates..."
-          openssl req -x509 -newkey rsa:2048 -keyout /output/privatekey.pem -out /output/certificate.pem \
-            -days 1 -nodes -subj "/CN=$$DOMAIN"
-        fi
-        chmod 644 /output/privatekey.pem /output/certificate.pem
-        while true; do
+
+        extract_certs() {
           if [ -f /traefik/acme.json ]; then
-            jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .certificate" /traefik/acme.json | base64 -d > /output/certificate.pem
-            jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .key" /traefik/acme.json | base64 -d > /output/privatekey.pem
-            chmod 644 /output/privatekey.pem /output/certificate.pem
-            echo "Certificates extracted for $$DOMAIN"
+            CERT=$(jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .certificate" /traefik/acme.json 2>/dev/null)
+            KEY=$(jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .key" /traefik/acme.json 2>/dev/null)
+            if [ -n "$$CERT" ] && [ "$$CERT" != "null" ] && [ -n "$$KEY" ] && [ "$$KEY" != "null" ]; then
+              echo "$$CERT" | base64 -d > /output/certificate.pem
+              echo "$$KEY" | base64 -d > /output/privatekey.pem
+              chmod 644 /output/certificate.pem /output/privatekey.pem
+              echo "Let's Encrypt certificates extracted for $$DOMAIN"
+              return 0
+            fi
           fi
-          sleep 3600
+          return 1
+        }
+
+        # Try to extract real certs first; fall back to self-signed placeholder
+        if ! extract_certs; then
+          if [ ! -f /output/privatekey.pem ] || [ ! -f /output/certificate.pem ]; then
+            echo "No Let's Encrypt cert yet. Generating self-signed placeholder..."
+            openssl req -x509 -newkey rsa:2048 -keyout /output/privatekey.pem -out /output/certificate.pem \
+              -days 1 -nodes -subj "/CN=$$DOMAIN"
+            chmod 644 /output/certificate.pem /output/privatekey.pem
+          fi
+        fi
+
+        # Monitor for cert changes and restart Neo4j when they update
+        PREV_HASH=$(md5sum /output/certificate.pem 2>/dev/null | cut -d' ' -f1)
+        while true; do
+          sleep 300
+          if extract_certs; then
+            NEW_HASH=$(md5sum /output/certificate.pem | cut -d' ' -f1)
+            if [ "$$PREV_HASH" != "$$NEW_HASH" ]; then
+              echo "Certificate changed — restarting Neo4j to pick up new cert..."
+              NEO4J_CONTAINER=$$(docker ps --format '{{.Names}}' | grep neo4j | grep -v backup | grep -v certs | head -1)
+              if [ -n "$$NEO4J_CONTAINER" ]; then
+                docker restart "$$NEO4J_CONTAINER" 2>/dev/null || true
+              fi
+              PREV_HASH="$$NEW_HASH"
+            fi
+          fi
         done
     restart: always
 
