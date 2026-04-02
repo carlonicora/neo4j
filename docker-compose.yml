@@ -13,11 +13,23 @@ services:
       - ./neo4j/ssl:/output
     environment:
       - DOMAIN=${SERVICE_FQDN_NEO4J:-localhost}
+    healthcheck:
+      test: ["CMD", "test", "-f", "/output/privatekey.pem", "-a", "-f", "/output/certificate.pem"]
+      interval: 5s
+      timeout: 2s
+      retries: 30
+      start_period: 30s
     command:
       - sh
       - -c
       - |
-        apk add --no-cache jq
+        apk add --no-cache jq openssl
+        # Generate self-signed placeholder certs so Neo4j can start before Traefik is ready
+        if [ ! -f /output/privatekey.pem ] || [ ! -f /output/certificate.pem ]; then
+          echo "Generating self-signed placeholder certificates..."
+          openssl req -x509 -newkey rsa:2048 -keyout /output/privatekey.pem -out /output/certificate.pem \
+            -days 1 -nodes -subj "/CN=$$DOMAIN"
+        fi
         while true; do
           if [ -f /traefik/acme.json ]; then
             jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .certificate" /traefik/acme.json | base64 -d > /output/certificate.pem
@@ -29,6 +41,9 @@ services:
     restart: always
 
   neo4j:
+    depends_on:
+      certs-dumper:
+        condition: service_healthy
     mem_limit: 6g
     memswap_limit: 7g
     networks:
