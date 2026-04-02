@@ -53,9 +53,10 @@ services:
     ports:
       # 7474 not exposed - access only via Traefik HTTPS
       - 7687:7687
-    # Traefik labels are managed by Coolify — do not add them here.
-    # Duplicates cause ACME errors because docker-compose variables are not
-    # resolved by the time Traefik reads the container labels.
+    # Routing and TLS labels are managed by Coolify — do not add them here.
+    # Only the port label is needed since Coolify doesn't set it.
+    labels:
+      - "traefik.http.services.neo4j.loadbalancer.server.port=7474"
     volumes:
       - ./neo4j/data:/data
       - ./neo4j/logs:/logs
