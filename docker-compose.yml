@@ -30,10 +30,12 @@ services:
           openssl req -x509 -newkey rsa:2048 -keyout /output/privatekey.pem -out /output/certificate.pem \
             -days 1 -nodes -subj "/CN=$$DOMAIN"
         fi
+        chmod 644 /output/privatekey.pem /output/certificate.pem
         while true; do
           if [ -f /traefik/acme.json ]; then
             jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .certificate" /traefik/acme.json | base64 -d > /output/certificate.pem
             jq -r ".letsencrypt.Certificates[] | select(.domain.main==\"$$DOMAIN\") | .key" /traefik/acme.json | base64 -d > /output/privatekey.pem
+            chmod 644 /output/privatekey.pem /output/certificate.pem
             echo "Certificates extracted for $$DOMAIN"
           fi
           sleep 3600
