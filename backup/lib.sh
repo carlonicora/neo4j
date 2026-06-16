@@ -1,7 +1,6 @@
 #!/bin/bash
 # Shared library for Neo4j backup/restore scripts.
-# Sourced by backup.sh, retention.sh, restore.sh. Assumes `set -o pipefail` in caller;
-# functions that pipe also set it locally for safety.
+# Sourced by backup.sh, retention.sh, restore.sh. Functions that use pipelines save and restore `pipefail` around their pipelines.
 
 NEO4J_ADMIN_IMAGE="${NEO4J_ADMIN_IMAGE:-neo4j/neo4j-admin:5.26-community-bullseye}"
 DATA_DIR="${DATA_DIR:-/data}"
@@ -36,6 +35,8 @@ stream_dump_to_s3() {
   local db="$1" date="$2"
   local key="${date}/${db}.dump"
   local est size_file streamed remote rc
+  local _pipefail_was
+  _pipefail_was=$(set +o | grep pipefail)
   set -o pipefail
 
   est=$(estimate_dump_size "$db")
@@ -60,11 +61,13 @@ stream_dump_to_s3() {
   if [ "${rc}" -eq 0 ]; then
     remote=$(s3_object_size "${key}")
     if [ -n "${streamed}" ] && [ "${streamed}" = "${remote}" ] && [ "${streamed}" -gt 0 ] 2>/dev/null; then
+      eval "${_pipefail_was}"
       return 0
     fi
   fi
 
   # Failure or verification mismatch: remove the partial object, keep prior backups intact.
-  aws s3 rm "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --no-progress 2>/dev/null || true
+  aws s3 rm "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --quiet 2>/dev/null || true
+  eval "${_pipefail_was}"
   return 1
 }
