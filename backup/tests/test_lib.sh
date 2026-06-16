@@ -128,4 +128,20 @@ drain_local_backlog
 if [ -d "${BACKUP_ROOT}/2026-03-11" ]; then assert_success 0 "failed upload keeps dir"; else assert_failure 0 "failed upload keeps dir"; fi
 rm -rf "${BACKUP_ROOT}"; teardown_stub_path
 
+echo "test: drain_local_backlog keeps dir on count mismatch"
+setup_stub_path
+S3_BUCKET="b" S3_ENDPOINT="https://e"
+BACKUP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/backups.XXXXXX")"
+mkdir -p "${BACKUP_ROOT}/2026-03-12"
+printf x > "${BACKUP_ROOT}/2026-03-12/neo4j.dump"
+printf y > "${BACKUP_ROOT}/2026-03-12/system.dump"   # 2 local files
+make_stub aws '
+case "$1 $2" in
+  "s3 cp") exit 0 ;;
+  "s3 ls") echo "2026-03-12 00:00:00      1 neo4j.dump"; exit 0 ;;   # only 1 object < 2 files
+esac'
+drain_local_backlog
+if [ -d "${BACKUP_ROOT}/2026-03-12" ]; then assert_success 0 "count mismatch keeps dir"; else assert_failure 0 "count mismatch keeps dir"; fi
+rm -rf "${BACKUP_ROOT}"; teardown_stub_path
+
 finish

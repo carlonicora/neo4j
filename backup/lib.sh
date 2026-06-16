@@ -87,7 +87,7 @@ drain_local_backlog() {
     if aws s3 cp "${dir}/" "s3://${S3_BUCKET}/${date}/" \
          --recursive --endpoint-url "${S3_ENDPOINT}" --no-progress 2>/dev/null; then
       remote_count=$(aws s3 ls "s3://${S3_BUCKET}/${date}/" \
-         --recursive --endpoint-url "${S3_ENDPOINT}" 2>/dev/null | grep -c .)
+         --recursive --endpoint-url "${S3_ENDPOINT}" 2>/dev/null | grep -c .) || remote_count=0
       if [ "${remote_count:-0}" -ge "${local_count}" ]; then
         rm -rf "${dir}"
       fi
