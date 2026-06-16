@@ -8,6 +8,10 @@ if [ -f /etc/environment.backup ]; then
   set +a
 fi
 
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${LIB_DIR}/lib.sh"
+
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-neo4j}"
 NEO4J_SERVICE="${NEO4J_SERVICE:-neo4j}"
 if [ -n "${BACKUP_NEO4J_CONTAINER:-}" ]; then
@@ -66,19 +70,12 @@ if [ -z "${HOST_BACKUP_DIR}" ]; then
   exit 1
 fi
 
-# --- Download from S3 if backup not found locally ---
+# --- Decide source: local files vs streaming from S3 ---
+STREAM_FROM_S3=0
 if [ ! -d "${BACKUP_DIR}" ] || [ -z "$(ls -A "${BACKUP_DIR}" 2>/dev/null)" ]; then
-  if [ -n "${S3_BUCKET}" ] && [ -n "${S3_ENDPOINT}" ]; then
-    log "Backup not found locally. Downloading from S3..."
-    mkdir -p "${BACKUP_DIR}"
-    if ! aws s3 cp "s3://${S3_BUCKET}/${BACKUP_DATE}/" "${BACKUP_DIR}/" \
-      --recursive \
-      --endpoint-url "${S3_ENDPOINT}" \
-      --no-progress 2>&1; then
-      log "ERROR: Failed to download backup from S3."
-      exit 1
-    fi
-    log "Downloaded from S3."
+  if s3_configured; then
+    log "Backup not found locally. Will stream from S3."
+    STREAM_FROM_S3=1
   else
     log "ERROR: Backup not found at ${BACKUP_DIR} and S3 not configured."
     exit 1
@@ -88,14 +85,11 @@ fi
 # --- Determine which databases to restore ---
 DATABASES=()
 if [ -n "${TARGET_DB}" ]; then
-  DUMP_FILE="${BACKUP_DIR}/${TARGET_DB}.dump"
-  if [ ! -f "${DUMP_FILE}" ]; then
-    log "ERROR: Dump file not found: ${DUMP_FILE}"
-    log "Available dumps:"
-    ls -1 "${BACKUP_DIR}"/*.dump 2>/dev/null | xargs -I{} basename {} .dump | sed 's/^/  /'
-    exit 1
-  fi
   DATABASES+=("${TARGET_DB}")
+elif [ "${STREAM_FROM_S3}" -eq 1 ]; then
+  while IFS= read -r dbname; do
+    [ -n "${dbname}" ] && DATABASES+=("${dbname}")
+  done < <(list_s3_databases "${BACKUP_DATE}")
 else
   for dump in "${BACKUP_DIR}"/*.dump; do
     [ -f "$dump" ] || continue
@@ -104,7 +98,7 @@ else
 fi
 
 if [ ${#DATABASES[@]} -eq 0 ]; then
-  log "ERROR: No dump files found in ${BACKUP_DIR}/"
+  log "ERROR: No databases found for ${BACKUP_DATE} (local or S3)."
   exit 1
 fi
 
@@ -145,15 +139,24 @@ log "Neo4j stopped."
 LOAD_FAILED=0
 for db in "${DATABASES[@]}"; do
   log "Loading database: ${db}..."
-  if docker run --rm \
-    -v "${HOST_DATA_DIR}:/data" \
-    -v "${HOST_BACKUP_DIR}/${BACKUP_DATE}:/backups" \
-    neo4j/neo4j-admin:5.26-community-bullseye \
-    neo4j-admin database load "${db}" --from-path=/backups --overwrite-destination=true 2>&1; then
-    log "  OK: ${db}"
+  if [ "${STREAM_FROM_S3}" -eq 1 ]; then
+    if stream_load_from_s3 "${db}" "${BACKUP_DATE}"; then
+      log "  OK: ${db} (streamed from S3)"
+    else
+      log "  FAILED: ${db}"
+      LOAD_FAILED=1
+    fi
   else
-    log "  FAILED: ${db}"
-    LOAD_FAILED=1
+    if docker run --rm \
+      -v "${HOST_DATA_DIR}:/data" \
+      -v "${HOST_BACKUP_DIR}/${BACKUP_DATE}:/backups" \
+      "${NEO4J_ADMIN_IMAGE}" \
+      neo4j-admin database load "${db}" --from-path=/backups --overwrite-destination=true 2>&1; then
+      log "  OK: ${db}"
+    else
+      log "  FAILED: ${db}"
+      LOAD_FAILED=1
+    fi
   fi
 done
 
