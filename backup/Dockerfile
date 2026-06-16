@@ -12,7 +12,7 @@ COPY restore.sh /usr/local/bin/restore.sh
 COPY lib.sh /usr/local/bin/lib.sh
 COPY tests/ /usr/local/bin/tests/
 
-RUN chmod +x /usr/local/bin/*.sh
+RUN chmod +x /usr/local/bin/*.sh /usr/local/bin/tests/*.sh
 
 ENTRYPOINT ["tini", "--"]
 CMD ["/usr/local/bin/entrypoint.sh"]

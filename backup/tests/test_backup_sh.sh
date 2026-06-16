@@ -12,7 +12,10 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/bk.XXXXXX")"
 mkdir -p "${WORK}/data/databases/neo4j"
 make_stub docker '
 case "$1" in
-  run) shift; if printf "%s\n" "$@" | grep -q -- "--to-stdout"; then printf "DUMPDATA"; fi; exit 0 ;;
+  run) shift
+    if printf "%s\n" "$@" | grep -q -- "--to-path"; then echo "LOCAL_DUMP" >> "${DUMPLOG}"; fi
+    if printf "%s\n" "$@" | grep -q -- "--to-stdout"; then printf "DUMPDATA"; fi
+    exit 0 ;;
   update|stop|start|inspect) exit 0 ;;
   ps) echo "neo4j-neo4j-1" ;;
 esac'
@@ -25,12 +28,14 @@ esac'
 make_stub du 'echo "1	$2"'
 RETENTION_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/ret.XXXXXX")"; printf '#!/bin/bash\nexit 0\n' > "${RETENTION_SCRIPT}"; chmod +x "${RETENTION_SCRIPT}"
 export RETENTION_SCRIPT
+DUMPLOG="$(mktemp "${TMPDIR:-/tmp}/dumplog.XXXXXX")"; export DUMPLOG
 HOST_DATA_DIR="${WORK}/data" DATA_DIR="${WORK}/data" \
   HOST_BACKUP_DIR="${WORK}/backups" BACKUP_ROOT="${WORK}/backups" \
   S3_BUCKET="b" S3_ENDPOINT="https://e" \
   bash "${HERE}/../backup.sh" >/dev/null 2>&1
 assert_success $? "backup.sh S3-mode run succeeds"
-if [ -d "${WORK}/backups" ]; then assert_failure 0 "no local backup dir created in S3 mode"; else assert_success 0 "no local backup dir created in S3 mode"; fi
-rm -rf "${WORK}" "${RETENTION_SCRIPT}"; teardown_stub_path
+assert_eq "" "$(cat "${DUMPLOG}")" "S3 mode never invokes local --to-path dump"
+if [ -d "${WORK}/backups" ]; then assert_failure 0 "no local staging dir under WORK in S3 mode"; else assert_success 0 "no local staging dir under WORK in S3 mode"; fi
+rm -rf "${WORK}" "${RETENTION_SCRIPT}"; rm -f "${DUMPLOG}"; teardown_stub_path
 
 finish

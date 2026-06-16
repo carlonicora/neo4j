@@ -51,7 +51,7 @@ fi
 
 log "=== Starting backup ==="
 log "Host data dir: ${HOST_DATA_DIR}"
-log "Host backup dir: ${HOST_BACKUP_DIR}"
+if [ -n "${HOST_BACKUP_DIR}" ]; then log "Host backup dir: ${HOST_BACKUP_DIR}"; fi
 
 # --- Phase 1: Discover databases ---
 DATABASES=()
@@ -125,7 +125,7 @@ fi
 docker update --restart=always "${CONTAINER}" 2>/dev/null || true
 log "Neo4j restarted."
 
-# --- Phase 6: Apply retention ---
+# --- Phase 5: Apply retention ---
 "${RETENTION_SCRIPT:-${LIB_DIR}/retention.sh}"
 
 log "=== Backup complete (dump failures: ${DUMP_FAILED}) ==="
