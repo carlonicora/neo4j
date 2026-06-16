@@ -13,8 +13,9 @@ setup_stub_path() {
 }
 
 teardown_stub_path() {
-  PATH="${ORIG_PATH}"
-  rm -rf "${STUB_BIN}"
+  PATH="${ORIG_PATH:?setup_stub_path not called}"
+  rm -rf "${STUB_BIN:?}"
+  unset STUB_BIN ORIG_PATH
 }
 
 # make_stub <name> <body-of-script>

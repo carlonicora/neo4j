@@ -16,6 +16,7 @@ s3_configured() {
 # Over-estimate is safe: it only enlarges multipart part size. Uses `du -sk`
 # (portable across busybox and BSD/macOS). Echoes 0 + rc 1 on failure.
 estimate_dump_size() {
+  [ -n "${1:-}" ] || { echo 0; return 1; }
   local db="$1" kb
   kb=$(du -sk "${DATA_DIR}/databases/${db}" 2>/dev/null | cut -f1)
   if [ -z "${kb}" ]; then echo 0; return 1; fi
