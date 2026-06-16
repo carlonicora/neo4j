@@ -8,7 +8,11 @@ if [ -f /etc/environment.backup ]; then
   set +a
 fi
 
-BACKUP_ROOT="/backups"
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${LIB_DIR}/lib.sh"
+
+BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 TODAY_EPOCH=$(date +%s)
 S3_BUCKET="${S3_BUCKET:-}"
 S3_ENDPOINT="${S3_ENDPOINT:-}"
@@ -52,17 +56,24 @@ should_keep() {
 log "Applying retention policy..."
 
 # --- Local retention ---
-for dir in "${BACKUP_ROOT}"/????-??-??; do
-  [ -d "$dir" ] || continue
-  dir_date=$(basename "$dir")
+if s3_configured; then
+  # S3 mode: new dumps never land locally. Drain any pre-existing local backlog
+  # to S3 (verified) and delete it. Keeps unverified dirs for retry.
+  log "S3 mode: draining local backlog (if any)..."
+  drain_local_backlog
+else
+  for dir in "${BACKUP_ROOT}"/????-??-??; do
+    [ -d "$dir" ] || continue
+    dir_date=$(basename "$dir")
 
-  if should_keep "$dir_date"; then
-    log "Keeping local: ${dir_date}"
-  else
-    log "Removing local: ${dir_date}"
-    rm -rf "$dir"
-  fi
-done
+    if should_keep "$dir_date"; then
+      log "Keeping local: ${dir_date}"
+    else
+      log "Removing local: ${dir_date}"
+      rm -rf "$dir"
+    fi
+  done
+fi
 
 # --- S3 retention ---
 if [ -n "${S3_BUCKET}" ] && [ -n "${S3_ENDPOINT}" ]; then
