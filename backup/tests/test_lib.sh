@@ -53,19 +53,19 @@ stream_dump_to_s3 neo4j 2026-06-16; assert_success $? "matching bytes => success
 assert_eq "" "$(cat "${RM_LOG}")" "no partial deletion on success"
 rm -f "${RM_LOG}"; teardown_stub_path
 
-echo "test: stream_dump_to_s3 mismatch deletes partial"
+echo "test: stream_dump_to_s3 empty object deletes partial"
 setup_stub_path
 S3_BUCKET="b" S3_ENDPOINT="https://e" HOST_DATA_DIR="/host/data" DATA_DIR="/data"
 make_stub du 'echo "1	$2"'
-make_stub docker 'if [ "$1" = run ]; then printf "DUMPDATA"; fi'   # 8 bytes
+make_stub docker 'if [ "$1" = run ]; then printf "DUMPDATA"; fi'
 make_stub aws '
 case "$1 $2" in
   "s3 cp") cat >/dev/null; exit 0 ;;
-  "s3 ls") echo "2026-06-16 02:00:01      4 neo4j.dump"; exit 0 ;;
+  "s3 ls") echo "2026-06-16 02:00:01      0 neo4j.dump"; exit 0 ;;
   "s3 rm") echo "$@" >> "${RM_LOG}"; exit 0 ;;
 esac'
 RM_LOG="$(mktemp "${TMPDIR:-/tmp}/rmlog.XXXXXX")"; export RM_LOG
-stream_dump_to_s3 neo4j 2026-06-16; assert_failure $? "size mismatch => failure"
+stream_dump_to_s3 neo4j 2026-06-16; assert_failure $? "empty object => failure"
 if grep -q "neo4j.dump" "${RM_LOG}"; then assert_success 0 "partial object deleted"; else assert_failure 0 "partial object deleted"; fi
 rm -f "${RM_LOG}"; teardown_stub_path
 

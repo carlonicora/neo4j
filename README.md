@@ -134,8 +134,9 @@ The backup service chooses a mode automatically from your S3 configuration:
 - **S3 mode** — when both `S3_BUCKET` and `S3_ENDPOINT` are set. Each database dump is
   **streamed directly to S3** (`neo4j-admin database dump --to-stdout | aws s3 cp -`) and
   never written to local disk. Uploads use `--expected-size` so large databases upload as
-  correctly-sized multipart objects, and each upload is verified by comparing the bytes
-  streamed against the resulting S3 object size. A failed or truncated upload is deleted
+  correctly-sized multipart objects, and each upload is verified by confirming the dump
+  process exited cleanly (via `pipefail`) and that the resulting S3 object exists and is
+  non-empty. A failed or truncated upload is deleted
   from S3 and the previous day's backup is left untouched. Any pre-existing local backups
   are uploaded to S3 and then removed, so the local disk no longer fills up.
 - **Local mode** — when S3 is not configured. Dumps are written to `HOST_BACKUP_DIR` and

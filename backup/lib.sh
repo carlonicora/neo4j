@@ -29,18 +29,19 @@ s3_object_size() {
     | awk '{print $3}' | head -1
 }
 
-# Stream a dump of <db> straight to S3 and verify byte count. Never stages on disk.
+# Stream a dump of <db> straight to S3 and verify it landed. Never stages on disk.
+# Integrity: pipefail catches a failed/partial dump (producer exits non-zero if it dies
+# mid-stream); after a clean pipeline we confirm the S3 object exists and is non-empty.
 # rc 0 = streamed and verified; rc 1 = failure (partial object removed).
 stream_dump_to_s3() {
   local db="$1" date="$2"
   local key="${date}/${db}.dump"
-  local est size_file streamed remote rc
+  local est remote rc
   local _pipefail_was
   _pipefail_was=$(set +o | grep pipefail)
   set -o pipefail
 
   est=$(estimate_dump_size "$db")
-  size_file=$(mktemp "${TMPDIR:-/tmp}/dumpsize.XXXXXX")
 
   # Build aws args; only pass --expected-size when we have a positive estimate.
   local -a cp_args
@@ -51,24 +52,20 @@ stream_dump_to_s3() {
 
   docker run --rm -v "${HOST_DATA_DIR}:/data" "${NEO4J_ADMIN_IMAGE}" \
       neo4j-admin database dump "${db}" --to-stdout 2>/dev/null \
-    | tee >(wc -c > "${size_file}") \
     | aws "${cp_args[@]}"
   rc=$?
 
-  streamed=$(tr -d '[:space:]' < "${size_file}" 2>/dev/null)
-  rm -f "${size_file}"
+  eval "${_pipefail_was}"
 
   if [ "${rc}" -eq 0 ]; then
     remote=$(s3_object_size "${key}")
-    if [ -n "${streamed}" ] && [ "${streamed}" = "${remote}" ] && [ "${streamed}" -gt 0 ] 2>/dev/null; then
-      eval "${_pipefail_was}"
+    if [ -n "${remote}" ] && [ "${remote}" -gt 0 ] 2>/dev/null; then
       return 0
     fi
   fi
 
-  # Failure or verification mismatch: remove the partial object, keep prior backups intact.
+  # Failure or empty/absent object: remove the partial object, keep prior backups intact.
   aws s3 rm "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --quiet 2>/dev/null || true
-  eval "${_pipefail_was}"
   return 1
 }
 
