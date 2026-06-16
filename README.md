@@ -127,6 +127,52 @@ S3_ENDPOINT=https://minio.example.com
 AWS_DEFAULT_REGION=us-east-1
 ```
 
+### Backup storage modes
+
+The backup service chooses a mode automatically from your S3 configuration:
+
+- **S3 mode** — when both `S3_BUCKET` and `S3_ENDPOINT` are set. Each database dump is
+  **streamed directly to S3** (`neo4j-admin database dump --to-stdout | aws s3 cp -`) and
+  never written to local disk. Uploads use `--expected-size` so large databases upload as
+  correctly-sized multipart objects, and each upload is verified by comparing the bytes
+  streamed against the resulting S3 object size. A failed or truncated upload is deleted
+  from S3 and the previous day's backup is left untouched. Any pre-existing local backups
+  are uploaded to S3 and then removed, so the local disk no longer fills up.
+- **Local mode** — when S3 is not configured. Dumps are written to `HOST_BACKUP_DIR` and
+  pruned by the local retention policy (7 days daily, 28 days weekly, 365 days monthly).
+
+The S3 connection itself is unchanged: the same `S3_BUCKET`, `S3_ENDPOINT`, and `AWS_*`
+credentials and the same `aws s3 ... --endpoint-url` mechanism are used, so any
+S3-compatible provider (AWS S3, Backblaze B2, Cloudflare R2, MinIO, DigitalOcean Spaces)
+works as before.
+
+Restore (`restore.sh <date> [database]`) automatically streams from S3 with
+`neo4j-admin database load --from-stdin` when the backup is not present locally.
+
+### Verifying S3 streaming backups
+
+To validate streaming end-to-end against your S3-compatible endpoint (this checks the one
+thing stub tests cannot: that the dump stream is not corrupted by log output):
+
+```bash
+# Trigger a backup manually inside the backup container:
+docker exec <backup-container> /usr/local/bin/backup.sh
+
+# Confirm the object exists and is non-empty:
+aws s3 ls "s3://${S3_BUCKET}/$(date +%F)/" --endpoint-url "${S3_ENDPOINT}"
+
+# Confirm the uploaded object is a valid archive (proves the stream was not corrupted):
+aws s3 cp "s3://${S3_BUCKET}/$(date +%F)/neo4j.dump" - --endpoint-url "${S3_ENDPOINT}" \
+  | docker run --rm -i neo4j/neo4j-admin:5.26-community-bullseye \
+      neo4j-admin database load neo4j --from-stdin --info
+
+# Confirm no local backup directory was created:
+ls -la "${HOST_BACKUP_DIR}" 2>/dev/null
+```
+
+Expected: the object is listed and non-empty; `--info` prints a valid file count, byte
+count, and format; and no new date directory appears under `HOST_BACKUP_DIR`.
+
 ## Manual Operations
 
 ### Trigger a Backup Manually
