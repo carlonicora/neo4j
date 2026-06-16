@@ -144,4 +144,32 @@ drain_local_backlog
 if [ -d "${BACKUP_ROOT}/2026-03-12" ]; then assert_success 0 "count mismatch keeps dir"; else assert_failure 0 "count mismatch keeps dir"; fi
 rm -rf "${BACKUP_ROOT}"; teardown_stub_path
 
+echo "test: list_s3_databases"
+setup_stub_path
+S3_BUCKET="b" S3_ENDPOINT="https://e"
+make_stub aws '
+if [ "$1 $2" = "s3 ls" ]; then
+  echo "2026-06-16 02:00:01      8 neo4j.dump"
+  echo "2026-06-16 02:00:02      9 system.dump"
+fi'
+OUT="$(list_s3_databases 2026-06-16 | tr "\n" "," )"
+assert_eq "neo4j,system," "${OUT}" "lists db names without .dump"
+teardown_stub_path
+
+echo "test: stream_load_from_s3 success"
+setup_stub_path
+S3_BUCKET="b" S3_ENDPOINT="https://e" HOST_DATA_DIR="/host/data"
+make_stub aws 'if [ "$1 $2" = "s3 cp" ]; then printf "DUMPDATA"; exit 0; fi'
+make_stub docker 'if [ "$1" = run ]; then cat >/dev/null; exit 0; fi'
+stream_load_from_s3 neo4j 2026-06-16; assert_success $? "load streams from S3"
+teardown_stub_path
+
+echo "test: stream_load_from_s3 load failure"
+setup_stub_path
+S3_BUCKET="b" S3_ENDPOINT="https://e" HOST_DATA_DIR="/host/data"
+make_stub aws 'if [ "$1 $2" = "s3 cp" ]; then printf "DUMPDATA"; exit 0; fi'
+make_stub docker 'if [ "$1" = run ]; then cat >/dev/null; exit 1; fi'
+stream_load_from_s3 neo4j 2026-06-16; assert_failure $? "load failure => rc 1"
+teardown_stub_path
+
 finish

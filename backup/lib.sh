@@ -94,3 +94,26 @@ drain_local_backlog() {
     fi
   done
 }
+
+# Echo database names (one per line) found under an S3 date prefix.
+list_s3_databases() {
+  local date="$1"
+  aws s3 ls "s3://${S3_BUCKET}/${date}/" --endpoint-url "${S3_ENDPOINT}" 2>/dev/null \
+    | awk '{print $4}' | grep '\.dump$' | sed 's/\.dump$//'
+}
+
+# Stream a dump from S3 directly into `neo4j-admin database load --from-stdin`.
+# rc 0 on success, rc 1 on failure.
+stream_load_from_s3() {
+  local db="$1" date="$2"
+  local _pipefail_was
+  _pipefail_was=$(set +o | grep pipefail)
+  set -o pipefail
+  aws s3 cp "s3://${S3_BUCKET}/${date}/${db}.dump" - \
+      --endpoint-url "${S3_ENDPOINT}" --no-progress \
+    | docker run --rm -i -v "${HOST_DATA_DIR}:/data" "${NEO4J_ADMIN_IMAGE}" \
+        neo4j-admin database load "${db}" --from-stdin --overwrite-destination=true
+  local rc=$?
+  eval "${_pipefail_was}"
+  return ${rc}
+}
