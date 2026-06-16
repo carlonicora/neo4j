@@ -100,4 +100,32 @@ stream_dump_to_s3 neo4j 2026-06-16; assert_failure $? "upload failure => failure
 if grep -q "neo4j.dump" "${RM_LOG}"; then assert_success 0 "partial deleted on upload failure"; else assert_failure 0 "partial deleted on upload failure"; fi
 rm -f "${RM_LOG}"; teardown_stub_path
 
+echo "test: drain_local_backlog removes verified dir"
+setup_stub_path
+S3_BUCKET="b" S3_ENDPOINT="https://e"
+BACKUP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/backups.XXXXXX")"
+mkdir -p "${BACKUP_ROOT}/2026-03-10"; printf x > "${BACKUP_ROOT}/2026-03-10/neo4j.dump"
+make_stub aws '
+case "$1 $2" in
+  "s3 cp") exit 0 ;;
+  "s3 ls") echo "2026-03-10 00:00:00      1 neo4j.dump"; exit 0 ;;
+esac'
+drain_local_backlog
+if [ -d "${BACKUP_ROOT}/2026-03-10" ]; then assert_failure 0 "verified dir removed"; else assert_success 0 "verified dir removed"; fi
+rm -rf "${BACKUP_ROOT}"; teardown_stub_path
+
+echo "test: drain_local_backlog keeps unverified dir"
+setup_stub_path
+S3_BUCKET="b" S3_ENDPOINT="https://e"
+BACKUP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/backups.XXXXXX")"
+mkdir -p "${BACKUP_ROOT}/2026-03-11"; printf x > "${BACKUP_ROOT}/2026-03-11/neo4j.dump"
+make_stub aws '
+case "$1 $2" in
+  "s3 cp") exit 1 ;;
+  "s3 ls") exit 0 ;;
+esac'
+drain_local_backlog
+if [ -d "${BACKUP_ROOT}/2026-03-11" ]; then assert_success 0 "failed upload keeps dir"; else assert_failure 0 "failed upload keeps dir"; fi
+rm -rf "${BACKUP_ROOT}"; teardown_stub_path
+
 finish

@@ -71,3 +71,26 @@ stream_dump_to_s3() {
   eval "${_pipefail_was}"
   return 1
 }
+
+# In S3 mode, push any pre-existing local date dirs to S3, verify, then delete them.
+# Unverified dirs are kept and retried on the next run. Clears the local-disk backlog.
+drain_local_backlog() {
+  local dir date local_count remote_count
+  for dir in "${BACKUP_ROOT}"/????-??-??; do
+    [ -d "${dir}" ] || continue
+    date=$(basename "${dir}")
+    local_count=$(find "${dir}" -type f ! -name '.*' 2>/dev/null | wc -l | tr -d '[:space:]')
+    if [ -z "${local_count}" ] || [ "${local_count}" -eq 0 ]; then
+      rmdir "${dir}" 2>/dev/null || true
+      continue
+    fi
+    if aws s3 cp "${dir}/" "s3://${S3_BUCKET}/${date}/" \
+         --recursive --endpoint-url "${S3_ENDPOINT}" --no-progress 2>/dev/null; then
+      remote_count=$(aws s3 ls "s3://${S3_BUCKET}/${date}/" \
+         --recursive --endpoint-url "${S3_ENDPOINT}" 2>/dev/null | grep -c .)
+      if [ "${remote_count:-0}" -ge "${local_count}" ]; then
+        rm -rf "${dir}"
+      fi
+    fi
+  done
+}
