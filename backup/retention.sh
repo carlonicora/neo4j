@@ -88,7 +88,7 @@ if [ -n "${S3_BUCKET}" ] && [ -n "${S3_ENDPOINT}" ]; then
       aws s3 rm "s3://${S3_BUCKET}/${s3_date}/" \
         --recursive \
         --endpoint-url "${S3_ENDPOINT}" \
-        --no-progress 2>&1 || log "WARNING: Failed to remove S3 prefix ${s3_date}"
+        --quiet 2>&1 || log "WARNING: Failed to remove S3 prefix ${s3_date}"
     fi
   done
 fi
