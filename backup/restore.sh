@@ -40,7 +40,7 @@ usage() {
   echo "  restore.sh 2026-03-01          # restore all databases from March 1st"
   echo "  restore.sh 2026-03-01 neo4j    # restore only the neo4j database"
   echo ""
-  echo "If the backup is not found locally, it will be downloaded from S3 (if configured)."
+  echo "If the backup is not found locally, it will be streamed from S3 (if configured)."
   exit 1
 }
 
@@ -65,8 +65,8 @@ if [ -z "${HOST_DATA_DIR}" ]; then
   exit 1
 fi
 
-if [ -z "${HOST_BACKUP_DIR}" ]; then
-  log "ERROR: HOST_BACKUP_DIR not set. Cannot restore."
+if ! s3_configured && [ -z "${HOST_BACKUP_DIR}" ]; then
+  log "ERROR: HOST_BACKUP_DIR not set and S3 not configured. Cannot restore."
   exit 1
 fi
 
