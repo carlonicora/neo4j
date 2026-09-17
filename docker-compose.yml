@@ -15,7 +15,16 @@ services:
     environment:
       - DOMAIN=${SERVICE_FQDN_NEO4J:-localhost}
     healthcheck:
-      test: ["CMD", "test", "-f", "/output/privatekey.pem", "-a", "-f", "/output/certificate.pem"]
+      test:
+        [
+          "CMD",
+          "test",
+          "-f",
+          "/output/privatekey.pem",
+          "-a",
+          "-f",
+          "/output/certificate.pem",
+        ]
       interval: 5s
       timeout: 2s
       retries: 30
@@ -113,7 +122,7 @@ services:
       - NEO4J_server_memory_heap_max__size=${NEO4J_server_memory_heap_max__size:-2500m}
       - NEO4J_server_memory_pagecache_size=${NEO4J_server_memory_pagecache_size:-1500m}
       - NEO4J_server_memory_off__heap_max__size=${NEO4J_server_memory_off__heap_max__size:-256m}
-    image: graphstack/dozerdb:5.26.3.0
+    image: graphstack/dozerdb:5.26.27.0
     restart: always
 
   neo4j-backup:
