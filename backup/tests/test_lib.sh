@@ -26,6 +26,52 @@ if grep -q UNRELATED "${ENVF}"; then assert_failure 0 "unrelated variables exclu
 assert_eq "600" "$(stat -f %Lp "${ENVF}" 2>/dev/null || stat -c %a "${ENVF}")" "file is 0600 (holds the password)"
 rm -f "${ENVF}"
 
+echo "test: date_to_days"
+assert_eq "0" "$(date_to_days 1970-01-01)" "epoch day is 0"
+assert_eq "20732" "$(date_to_days 2026-10-06)" "2026-10-06 is day 20732 (a Tuesday)"
+assert_eq "1" "$(( $(date_to_days 2024-03-01) - $(date_to_days 2024-02-29) ))" "leap day handled"
+
+echo "test: retention_bucket"
+assert_eq "$(retention_bucket weekly 2026-10-05)" "$(retention_bucket weekly 2026-10-11)" "Monday and Sunday share a week"
+if [ "$(retention_bucket weekly 2026-10-04)" != "$(retention_bucket weekly 2026-10-05)" ]; then assert_success 0 "Sunday before Monday is another week"; else assert_failure 0 "Sunday before Monday is another week"; fi
+assert_eq "2026-10" "$(retention_bucket monthly 2026-10-06)" "monthly bucket"
+assert_eq "2026" "$(retention_bucket yearly 2026-10-06)" "yearly bucket"
+
+echo "test: retention_validate"
+retention_validate "daily=7,weekly=4,monthly=12" 2>/dev/null; assert_success $? "default policy valid"
+retention_validate "daily=14" 2>/dev/null; assert_success $? "single rule valid"
+retention_validate "" 2>/dev/null; assert_failure $? "empty rejected"
+retention_validate "hourly=3" 2>/dev/null; assert_failure $? "unknown rule rejected"
+retention_validate "daily=x" 2>/dev/null; assert_failure $? "non-number rejected"
+retention_validate "daily=7,daily=3" 2>/dev/null; assert_failure $? "duplicate rule rejected"
+retention_validate "daily=0,weekly=0" 2>/dev/null; assert_failure $? "all-zero rejected"
+
+echo "test: retention_keep_dates daily=14 keeps the 14 newest days"
+DATES=""; for i in $(seq 1 20); do DATES="${DATES} 2026-09-$(printf %02d $i)"; done
+# shellcheck disable=SC2086
+KEEP=$(retention_keep_dates "daily=14" ${DATES} | awk '{print $1}' | sort | tr '\n' ' ')
+assert_eq "2026-09-07 2026-09-08 2026-09-09 2026-09-10 2026-09-11 2026-09-12 2026-09-13 2026-09-14 2026-09-15 2026-09-16 2026-09-17 2026-09-18 2026-09-19 2026-09-20 " "${KEEP}" "days 7..20 kept"
+
+echo "test: retention_keep_dates daily=3,weekly=2 (borg semantics: weeks already represented by daily keepers do not count)"
+KEEP=$(retention_keep_dates "daily=3,weekly=2" 2026-10-06 2026-10-05 2026-10-04 2026-10-03 2026-10-02 2026-09-28 2026-09-21 2026-09-14 | sort | tr '\n' '|')
+assert_eq "2026-09-14 weekly|2026-09-21 weekly|2026-10-04 daily|2026-10-05 daily|2026-10-06 daily|" "${KEEP}" "3 daily + 2 older weeks; 10-03, 10-02, 09-28 deleted"
+
+echo "test: retention_keep_dates skips periods without backups"
+KEEP=$(retention_keep_dates "daily=3" 2026-10-06 2026-10-01 2026-09-20 | awk '{print $1}' | sort | tr '\n' ' ')
+assert_eq "2026-09-20 2026-10-01 2026-10-06 " "${KEEP}" "three real backups kept despite gaps"
+
+echo "test: retention_keep_dates monthly keeps newest per month"
+KEEP=$(retention_keep_dates "monthly=2" 2026-10-06 2026-10-01 2026-09-30 2026-08-15 | awk '{print $1}' | sort | tr '\n' ' ')
+assert_eq "2026-09-30 2026-10-06 " "${KEEP}" "newest of the last two months"
+
+echo "test: retention_keep_dates last=1"
+assert_eq "2026-10-06 last" "$(retention_keep_dates "last=1" 2026-10-01 2026-10-06 2026-10-04)" "newest only, regardless of input order"
+
+echo "test: retention_keep_dates invalid policy keeps nothing and fails"
+OUT=$(retention_keep_dates "bogus" 2026-10-06 2>/dev/null); RC=$?
+assert_failure ${RC} "bad policy => rc 1"
+assert_eq "" "${OUT}" "bad policy => no output"
+
 echo "test: s3_object_size"
 setup_stub_path
 S3_BUCKET="b" S3_ENDPOINT="https://e"

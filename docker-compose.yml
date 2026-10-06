@@ -144,6 +144,8 @@ services:
       - NEO4J_AUTH=${NEO4J_AUTH}
       - HOST_DATA_DIR=${HOST_DATA_DIR:-}
       - HOST_BACKUP_DIR=${HOST_BACKUP_DIR:-}
+      # Retention policy, e.g. daily=14 or daily=7,weekly=4,monthly=12 (see README)
+      - BACKUP_RETENTION=${BACKUP_RETENTION:-}
       - S3_BUCKET=${S3_BUCKET:-}
       - S3_ENDPOINT=${S3_ENDPOINT:-}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}

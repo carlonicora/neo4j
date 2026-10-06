@@ -182,6 +182,7 @@ HOST_BACKUP_DIR=/data/coolify/applications/<app-id>/data-backup
 | ----------------------- | --------------------------------------------- | ------------- |
 | `HOST_DATA_DIR`         | Absolute host path to `neo4j/data` directory  | For restore   |
 | `HOST_BACKUP_DIR`       | Absolute host path to `data-backup` directory | For backups   |
+| `BACKUP_RETENTION`      | Which backups to keep, e.g. `daily=7,weekly=4,monthly=12` (see [Retention Policy](#retention-policy)) | No, has default |
 | `S3_BUCKET`             | S3 bucket name                                | For S3 upload |
 | `S3_ENDPOINT`           | S3-compatible endpoint URL                    | For S3 upload |
 | `AWS_ACCESS_KEY_ID`     | S3 access key                                 | For S3 upload |
@@ -216,13 +217,27 @@ A safety watchdog still runs every 5 minutes and restarts Neo4j if it is ever fo
 
 ### Retention Policy
 
-| Tier    | Rule                 | Kept for |
-| ------- | -------------------- | -------- |
-| Daily   | All backups          | 7 days   |
-| Weekly  | Sunday backups       | 28 days  |
-| Monthly | 1st-of-month backups | 365 days |
+Which dated backups to keep is set by one variable, `BACKUP_RETENTION`, applied the same way to local date folders and to S3 date prefixes. It is a comma-separated list of rules:
 
-A single backup can satisfy multiple tiers (e.g., Sunday January 1st counts as daily, weekly, and monthly).
+| Rule | Keeps |
+| --- | --- |
+| `last=N` | the N newest backups |
+| `daily=N` | the newest backup of each of the last N days that have one |
+| `weekly=N` | the newest backup of each of the last N weeks (Monday to Sunday) |
+| `monthly=N` | the newest backup of each of the last N calendar months |
+| `yearly=N` | the newest backup of each of the last N calendar years |
+
+The rules follow the convention of borg, restic and Proxmox Backup Server. They apply in the order above. A backup already kept by an earlier rule still marks its week or month as covered but does not count towards the later rule, so `daily=7,weekly=4` keeps 7 days and then 4 *older* weeks. Days, weeks or months with no backup are skipped, so a few failed nights never shrink what you keep. Everything not kept by any rule is deleted.
+
+Examples:
+
+```env
+BACKUP_RETENTION=daily=14                              # one per day for the last 14 days
+BACKUP_RETENTION=daily=7,weekly=4                      # a week of dailies, then a month of weeklies
+BACKUP_RETENTION=daily=7,weekly=4,monthly=12,yearly=2  # full GFS, two years deep
+```
+
+The default when the variable is unset is `daily=7,weekly=4,monthly=12`. An empty, unparsable or all-zero policy stops the retention step with an error and deletes nothing.
 
 ### S3 Provider Examples
 
@@ -265,7 +280,7 @@ The backup service chooses a mode automatically from your S3 configuration:
   run, and the previous day's backup is left untouched. Any pre-existing local date folders
   are uploaded to S3 and then removed, so the local disk does not fill up.
 - **Local mode** — when S3 is not configured. Dumps are written to `HOST_BACKUP_DIR` and
-  pruned by the local retention policy (7 days daily, 28 days weekly, 365 days monthly).
+  pruned by the [retention policy](#retention-policy).
 
 The S3 connection itself is unchanged: the same `S3_BUCKET`, `S3_ENDPOINT`, and `AWS_*`
 credentials and the same `aws s3 ... --endpoint-url` mechanism are used, so any
