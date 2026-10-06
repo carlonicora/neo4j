@@ -7,6 +7,19 @@ NEO4J_ADMIN_IMAGE="${NEO4J_ADMIN_IMAGE:-neo4j/neo4j-admin:5.26-community-bullsey
 DATA_DIR="${DATA_DIR:-/data}"
 BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 
+# Write the variables the cron jobs need to <file>, one shell-safe assignment per line.
+# Values are quoted with printf %q so spaces, quotes, $ and ; in a password survive `source`.
+write_backup_env_file() {
+  local file="$1" name value
+  : > "${file}"
+  chmod 600 "${file}"
+  env | grep -E '^(AWS_|S3_|HOST_|COMPOSE_|BACKUP_|DOCKER_HOST|NEO4J_AUTH)' | while IFS= read -r line; do
+    name="${line%%=*}"
+    value="${line#*=}"
+    printf '%s=%q\n' "${name}" "${value}" >> "${file}"
+  done
+}
+
 # True when S3-compatible storage is configured. Connection logic is unchanged.
 s3_configured() {
   [ -n "${S3_BUCKET:-}" ] && [ -n "${S3_ENDPOINT:-}" ]

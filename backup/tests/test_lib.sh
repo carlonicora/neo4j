@@ -16,6 +16,16 @@ assert_eq "neo4j/neo4j-admin:5.26-community-bullseye" \
   "$(unset NEO4J_ADMIN_IMAGE; source "${HERE}/../lib.sh"; echo "${NEO4J_ADMIN_IMAGE}")" \
   "image default set"
 
+echo "test: write_backup_env_file quotes values so source cannot execute them"
+ENVF="$(mktemp "${TMPDIR:-/tmp}/envf.XXXXXX")"
+( export NEO4J_AUTH='neo4j/pa ss;ad min$x"y'"'"'z' S3_BUCKET='b' UNRELATED='nope'; write_backup_env_file "${ENVF}" )
+assert_success $? "writes without error"
+( set -a; source "${ENVF}"; set +a; [ "${NEO4J_AUTH}" = 'neo4j/pa ss;ad min$x"y'"'"'z' ] ); assert_success $? "password with space ; \$ quotes survives source"
+( set -a; source "${ENVF}"; set +a; [ "${S3_BUCKET}" = "b" ] ); assert_success $? "plain value survives source"
+if grep -q UNRELATED "${ENVF}"; then assert_failure 0 "unrelated variables excluded"; else assert_success 0 "unrelated variables excluded"; fi
+assert_eq "600" "$(stat -f %Lp "${ENVF}" 2>/dev/null || stat -c %a "${ENVF}")" "file is 0600 (holds the password)"
+rm -f "${ENVF}"
+
 echo "test: s3_object_size"
 setup_stub_path
 S3_BUCKET="b" S3_ENDPOINT="https://e"

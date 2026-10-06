@@ -3,7 +3,9 @@ set -euo pipefail
 
 # Export environment variables to a file so cron jobs can source them
 # (cron does not inherit the container's environment)
-env | grep -E '^(AWS_|S3_|HOST_|COMPOSE_|BACKUP_|DOCKER_HOST|NEO4J_AUTH)' > /etc/environment.backup || true
+# shellcheck source=/dev/null
+source /usr/local/bin/lib.sh
+write_backup_env_file /etc/environment.backup || true
 
 # Create cron job - run at 2:00 AM daily
 echo "0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1" > /etc/crontabs/root
