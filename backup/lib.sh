@@ -1,6 +1,7 @@
 #!/bin/bash
 # Shared library for Neo4j backup/restore scripts.
 # Sourced by backup.sh, retention.sh, restore.sh. Functions that use pipelines save and restore `pipefail` around their pipelines.
+# NEO4J_ADMIN_IMAGE and DATA_DIR are used by restore (load); backups themselves come from the hot backup plugin.
 
 NEO4J_ADMIN_IMAGE="${NEO4J_ADMIN_IMAGE:-neo4j/neo4j-admin:5.26-community-bullseye}"
 DATA_DIR="${DATA_DIR:-/data}"
@@ -11,17 +12,6 @@ s3_configured() {
   [ -n "${S3_BUCKET:-}" ] && [ -n "${S3_ENDPOINT:-}" ]
 }
 
-# Estimate dump size in bytes from the on-disk database footprint.
-# Over-estimate is safe: it only enlarges multipart part size. Uses `du -sk`
-# (portable across busybox and BSD/macOS). Echoes 0 + rc 1 on failure.
-estimate_dump_size() {
-  [ -n "${1:-}" ] || { echo 0; return 1; }
-  local db="$1" kb
-  kb=$(du -sk "${DATA_DIR}/databases/${db}" 2>/dev/null | cut -f1)
-  if [ -z "${kb}" ]; then echo 0; return 1; fi
-  echo $(( kb * 1024 ))
-}
-
 # Echo the byte size of an S3 object (empty if it does not exist).
 s3_object_size() {
   local key="$1"
@@ -29,42 +19,19 @@ s3_object_size() {
     | awk '{print $3}' | head -1
 }
 
-# Stream a dump of <db> straight to S3 and verify it landed. Never stages on disk.
-# Integrity: pipefail catches a failed/partial dump (producer exits non-zero if it dies
-# mid-stream); after a clean pipeline we confirm the S3 object exists and is non-empty.
-# rc 0 = streamed and verified; rc 1 = failure (partial object removed).
-stream_dump_to_s3() {
-  local db="$1" date="$2"
+# Upload a finished dump file to S3 as <date>/<db>.dump and verify it landed with the same
+# size. rc 0 = uploaded and verified; rc 1 = failure (partial object removed, local file untouched).
+upload_dump_to_s3() {
+  local file="$1" db="$2" date="$3"
   local key="${date}/${db}.dump"
-  local est remote rc
-  local _pipefail_was
-  _pipefail_was=$(set +o | grep pipefail)
-  set -o pipefail
-
-  est=$(estimate_dump_size "$db")
-
-  # Build aws args; only pass --expected-size when we have a positive estimate.
-  local -a cp_args
-  cp_args=(s3 cp - "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --no-progress)
-  if [ "${est}" -gt 0 ] 2>/dev/null; then
-    cp_args+=(--expected-size "${est}")
-  fi
-
-  docker run --rm -v "${HOST_DATA_DIR}:/data" "${NEO4J_ADMIN_IMAGE}" \
-      neo4j-admin database dump "${db}" --to-stdout 2>/dev/null \
-    | aws "${cp_args[@]}"
-  rc=$?
-
-  eval "${_pipefail_was}"
-
-  if [ "${rc}" -eq 0 ]; then
-    remote=$(s3_object_size "${key}")
-    if [ -n "${remote}" ] && [ "${remote}" -gt 0 ] 2>/dev/null; then
+  local local_size remote_size
+  local_size=$(wc -c < "${file}" | tr -d '[:space:]')
+  if aws s3 cp "${file}" "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --no-progress; then
+    remote_size=$(s3_object_size "${key}")
+    if [ -n "${remote_size}" ] && [ "${remote_size}" = "${local_size}" ]; then
       return 0
     fi
   fi
-
-  # Failure or empty/absent object: remove the partial object, keep prior backups intact.
   aws s3 rm "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --quiet 2>/dev/null || true
   return 1
 }

@@ -6,9 +6,134 @@ Neo4j graph database running [DozerDB](https://dozerdb.org/) (Neo4j Community Ed
 
 | Service          | Description                                                   |
 | ---------------- | ------------------------------------------------------------- |
-| **neo4j**        | DozerDB 5.26.27.0 graph database with APOC and GDS plugins    |
+| **neo4j**        | DozerDB 5.26.27.0 graph database with APOC, GDS and hot backup plugins |
 | **certs-dumper** | Extracts Let's Encrypt certificates from Traefik for Bolt TLS |
 | **neo4j-backup** | Automated daily backup with retention and S3 upload           |
+
+## Plugins
+
+APOC is installed at boot by the Neo4j entrypoint (`NEO4J_PLUGINS=["apoc"]`).
+
+OpenGDS is **baked into the image** — [`neo4j-image/Dockerfile`](neo4j-image/Dockerfile) copies `open-gds-2.13.11.jar` into `/plugins`, so the `neo4j` service is built rather than pulled.
+
+The **hot backup plugin** (`neo4j-hot-backup-5.26.27.0.jar`) is baked in the same way. See [Hot Backup Plugin](#hot-backup-plugin).
+
+It cannot be a bind mount. Coolify deploys this repository as a Docker Compose resource, which copies only the transformed compose file and `.env` to the destination host — never the repository. It then pre-creates any missing bind-mount directory, empty. A jar committed in this repo and mounted at `/plugins` therefore never reaches production, and every `gds.*` call fails with `Unknown function 'gds.version'`.
+
+Upgrading OpenGDS: drop the new jar in `neo4j-image/`, update the `COPY` line and the `FROM` tag to a version pair that matches, then redeploy. Plugins are only read at boot, so the container has to restart.
+
+## Hot Backup Plugin
+
+### What it is
+
+DozerDB is Neo4j Community Edition, and Community has no online backup: `neo4j-admin database backup` exists only in Enterprise. Until now the only safe backup was to stop the database, dump it, and start it again, which costs a few minutes of downtime every night.
+
+`neo4j-hot-backup` is a small plugin jar, built from the separate `neo4j-backup` project (its own repository, with sources, tests and a README of its own), that adds the missing piece to Community. It uses the same kernel mechanism Enterprise uses: it forces a checkpoint, blocks further checkpoints while it copies the store files and the transaction log, then releases. The copy is consistent as of the moment the backup started, and the database keeps serving reads and writes the whole time.
+
+The output is a normal `.dump` file. `neo4j-admin database load` and the existing `restore.sh` read it without any change.
+
+### What it does
+
+The plugin adds two procedures. Both need admin rights.
+
+| Procedure | What it does |
+| --- | --- |
+| `CALL backup.database('neo4j')` | Backs up one database. Throws if the database does not exist or is not running. |
+| `CALL backup.all()` | Backs up every database, `system` included. Never throws for a single database: each one gets its own row. |
+
+Each row has these columns:
+
+| Column | Meaning |
+| --- | --- |
+| `database` | Database name |
+| `path` | Where the dump was written inside the container, e.g. `/var/lib/neo4j/backups/neo4j-20261005-091200.dump` |
+| `bytes` | Size of the dump |
+| `millis` | How long it took |
+| `status` | `ok`, `skipped: not available` (database stopped), or `failed: <reason>` |
+
+Files are named `<database>-<yyyyMMdd-HHmmss>.dump`. A second backup of the same database within the same second fails rather than overwrite; the earlier file is never touched.
+
+### How it is installed here
+
+Three things make it work in this deployment:
+
+- [`neo4j-image/Dockerfile`](neo4j-image/Dockerfile) copies the jar into `/plugins`, next to OpenGDS. It is pinned to the server version in the `FROM` line; when DozerDB is upgraded, rebuild the jar from the `neo4j-backup` project against the new version first.
+- [`docker-compose.yml`](docker-compose.yml) lists `backup.*` in `NEO4J_dbms_security_procedures_unrestricted` and `..._allowlist`. The procedures touch kernel internals, so Neo4j refuses to load them sandboxed, exactly like APOC.
+- [`docker-compose.yml`](docker-compose.yml) mounts `./data-backup` at `/var/lib/neo4j/backups`, the plugin's output directory (`server.backup.directory`). That is the same host folder the backup container uses, so dumps appear under `HOST_BACKUP_DIR` on the host.
+
+Plugins load at boot, so the `neo4j` service must be rebuilt and restarted after these changes.
+
+### Manual use
+
+Run a backup of everything while Neo4j is up:
+
+```bash
+docker compose exec neo4j cypher-shell -u neo4j -p <password> "CALL backup.all()"
+```
+
+Or just one database:
+
+```bash
+docker compose exec neo4j cypher-shell -u neo4j -p <password> "CALL backup.database('neo4j')"
+```
+
+The same statements work in Neo4j Browser. Run them against a user database such as `neo4j` (cypher-shell's default), not against `system`, which only accepts admin commands. Check the `status` column of every row: `ok` means the file at `path` is complete and loadable.
+
+The files land in `data-backup/` on the host:
+
+```bash
+ls -la data-backup/*.dump
+```
+
+To restore one, give it the name `restore.sh` expects (`<database>.dump` inside a date folder) and run the normal restore:
+
+```bash
+mkdir -p data-backup/2026-10-05
+cp data-backup/neo4j-20261005-091200.dump data-backup/2026-10-05/neo4j.dump
+docker compose exec -it neo4j-backup restore.sh 2026-10-05 neo4j
+```
+
+Restore still stops Neo4j, loads, and restarts it. The first start after a load runs recovery, which replays the tail of the transaction log that was copied while writes were in flight. That is expected and takes seconds.
+
+### Automatic use
+
+The scheduled job in the `neo4j-backup` container ([`backup/backup.sh`](backup/backup.sh)) uses the plugin. Neo4j is never stopped. Every night at 2:00 AM it:
+
+1. Runs `CALL backup.all()` inside the Neo4j container through `cypher-shell`, using the `NEO4J_AUTH` credentials passed to the backup service.
+2. Reads the rows. Every row must say `ok`; any other status is logged as `FAILED` and makes the job exit non-zero, while the other databases are still processed.
+3. Files each dump. In local mode it moves the file to `data-backup/<date>/<database>.dump`. In S3 mode it uploads it to `<date>/<database>.dump`, checks the object size matches, then deletes the local file. If an upload fails, the dump stays under `data-backup/<date>/` and the next run's retention step retries it.
+4. Applies the retention policy as before.
+
+Disk note: the plugin writes the dump on the server first, so `data-backup` needs room for one full set of dumps even in S3 mode. They are deleted as soon as each upload is verified.
+
+Trigger it by hand with:
+
+```bash
+docker compose exec neo4j-backup /usr/local/bin/backup.sh
+```
+
+### Verifying a hot backup
+
+Load the file into a throwaway container and count something you know:
+
+```bash
+mkdir -p /tmp/hb && cp data-backup/neo4j-<timestamp>.dump /tmp/hb/neo4j.dump
+docker run --rm -v /tmp/hb-data:/data -v /tmp/hb:/backups graphstack/dozerdb:5.26.27.0 \
+  neo4j-admin database load neo4j --from-path=/backups --overwrite-destination=true
+docker run -d --name hb-check -e NEO4J_AUTH=neo4j/check1234 -v /tmp/hb-data:/data graphstack/dozerdb:5.26.27.0
+# wait for it to come up, then:
+docker exec hb-check cypher-shell -u neo4j -p check1234 "MATCH (n) RETURN count(n)"
+docker rm -f hb-check
+```
+
+`neo4j-admin database check` works on the restored data only after that first start, because the store needs recovery first.
+
+### Troubleshooting the plugin
+
+- **`There is no procedure with the name backup.all`**: the jar did not load. `docker compose exec neo4j ls /plugins` must list `neo4j-hot-backup-5.26.27.0.jar`. If it is missing, the service was pulled instead of built; rebuild it.
+- **`backup.all is unavailable because it is sandboxed`**: `backup.*` is missing from `NEO4J_dbms_security_procedures_unrestricted`.
+- **`server.backup.directory is not a writable directory`**: the `./data-backup` mount is missing or not writable by the `neo4j` user inside the container (uid 7474). On the host, `chmod 777 data-backup` is the blunt fix.
+- **`status = failed: ... already exists`**: two backups of the same database in the same second. Run the job once, not in a loop.
 
 ## Quick Start
 
@@ -55,7 +180,7 @@ HOST_BACKUP_DIR=/data/coolify/applications/<app-id>/data-backup
 
 | Variable                | Description                                   | Required      |
 | ----------------------- | --------------------------------------------- | ------------- |
-| `HOST_DATA_DIR`         | Absolute host path to `neo4j/data` directory  | For backups   |
+| `HOST_DATA_DIR`         | Absolute host path to `neo4j/data` directory  | For restore   |
 | `HOST_BACKUP_DIR`       | Absolute host path to `data-backup` directory | For backups   |
 | `S3_BUCKET`             | S3 bucket name                                | For S3 upload |
 | `S3_ENDPOINT`           | S3-compatible endpoint URL                    | For S3 upload |
@@ -63,7 +188,7 @@ HOST_BACKUP_DIR=/data/coolify/applications/<app-id>/data-backup
 | `AWS_SECRET_ACCESS_KEY` | S3 secret key                                 | For S3 upload |
 | `AWS_DEFAULT_REGION`    | S3 region (default: `us-east-1`)              | No            |
 
-If `HOST_DATA_DIR` or `HOST_BACKUP_DIR` are not set, backups are silently skipped. If S3 variables are not set, only local backups are created.
+If neither `HOST_BACKUP_DIR` nor S3 is set, backups are silently skipped. If S3 variables are not set, only local backups are created. `HOST_DATA_DIR` is still needed by `restore.sh`. The backup service also needs `NEO4J_AUTH` (passed through from `.env`) to call the backup procedures.
 
 ### Finding Host Paths (Coolify)
 
@@ -78,18 +203,16 @@ In the Coolify dashboard, go to your service's settings and look at the volume m
 
 ### How It Works
 
-DozerDB is based on Neo4j Community Edition, which does **not** support online backups. The database must be stopped before dumping (see [DozerDB/dozerdb-plugin#61](https://github.com/DozerDB/dozerdb-plugin/issues/61)).
+DozerDB is Neo4j Community Edition, which has no online backup of its own. The [Hot Backup Plugin](#hot-backup-plugin) adds one, so the nightly job runs with the database online.
 
 The backup runs daily at **2:00 AM** (server timezone) and follows this sequence:
 
-1. **Discover** all databases by listing `/data/databases/`
-2. **Stop** the Neo4j container (temporarily disables `restart: always` policy)
-3. **Dump** each database using the `neo4j/neo4j-admin` Docker image
-4. **Restart** Neo4j and restore `restart: always` policy (always, even if some dumps fail)
-5. **Upload** to S3 (if configured)
-6. **Apply** retention policy (local and S3)
+1. **Back up** every database with `CALL backup.all()`, which writes one `.dump` per database into `data-backup/` while Neo4j keeps serving queries
+2. **Check** every returned row is `ok`; anything else is logged as a failure
+3. **File** each dump by date locally, or **upload** it to S3 and delete the local copy once the upload is verified
+4. **Apply** retention policy (local and S3)
 
-A safety watchdog runs every 5 minutes to ensure Neo4j is running, guarding against crashes during backup.
+A safety watchdog still runs every 5 minutes and restarts Neo4j if it is ever found stopped.
 
 ### Retention Policy
 
@@ -135,14 +258,12 @@ AWS_DEFAULT_REGION=us-east-1
 
 The backup service chooses a mode automatically from your S3 configuration:
 
-- **S3 mode** — when both `S3_BUCKET` and `S3_ENDPOINT` are set. Each database dump is
-  **streamed directly to S3** (`neo4j-admin database dump --to-stdout | aws s3 cp -`) and
-  never written to local disk. Uploads use `--expected-size` so large databases upload as
-  correctly-sized multipart objects, and each upload is verified by confirming the dump
-  process exited cleanly (via `pipefail`) and that the resulting S3 object exists and is
-  non-empty. A failed or truncated upload is deleted
-  from S3 and the previous day's backup is left untouched. Any pre-existing local backups
-  are uploaded to S3 and then removed, so the local disk no longer fills up.
+- **S3 mode** — when both `S3_BUCKET` and `S3_ENDPOINT` are set. Each dump written by the
+  plugin is uploaded with `aws s3 cp`, the S3 object size is compared with the local file,
+  and the local file is deleted only after that check passes. A failed or truncated upload
+  is deleted from S3, the dump is kept under `data-backup/<date>/` and retried by the next
+  run, and the previous day's backup is left untouched. Any pre-existing local date folders
+  are uploaded to S3 and then removed, so the local disk does not fill up.
 - **Local mode** — when S3 is not configured. Dumps are written to `HOST_BACKUP_DIR` and
   pruned by the local retention policy (7 days daily, 28 days weekly, 365 days monthly).
 
@@ -154,10 +275,9 @@ works as before.
 Restore (`restore.sh <date> [database]`) automatically streams from S3 with
 `neo4j-admin database load --from-stdin` when the backup is not present locally.
 
-### Verifying S3 streaming backups
+### Verifying S3 backups
 
-To validate streaming end-to-end against your S3-compatible endpoint (this checks the one
-thing stub tests cannot: that the dump stream is not corrupted by log output):
+To validate the upload end-to-end against your S3-compatible endpoint:
 
 ```bash
 # Trigger a backup manually inside the backup container:
@@ -171,12 +291,12 @@ aws s3 cp "s3://${S3_BUCKET}/$(date +%F)/neo4j.dump" - --endpoint-url "${S3_ENDP
   | docker run --rm -i neo4j/neo4j-admin:5.26-community-bullseye \
       neo4j-admin database load neo4j --from-stdin --info
 
-# Confirm no local backup directory was created:
+# Confirm the local copy was removed after the verified upload:
 ls -la "${HOST_BACKUP_DIR}" 2>/dev/null
 ```
 
 Expected: the object is listed and non-empty; `--info` prints a valid file count, byte
-count, and format; and no new date directory appears under `HOST_BACKUP_DIR`.
+count, and format; and no `.dump` file is left under `HOST_BACKUP_DIR`.
 
 ## Manual Operations
 
@@ -216,11 +336,11 @@ If the backup is not found locally, it will be automatically downloaded from S3 
 
 ### Backup skipped silently
 
-Check that `HOST_DATA_DIR` and `HOST_BACKUP_DIR` are set in `.env`. These must be absolute host paths, not container paths.
+Check that `HOST_BACKUP_DIR` (or the S3 variables) is set in `.env`. Host paths must be absolute host paths, not container paths.
 
-### Neo4j not restarting after backup
+### Neo4j not running
 
-The watchdog checks every 5 minutes and will auto-restart Neo4j, restoring the `restart: always` policy if it was left disabled by a crashed backup. To manually restart:
+The backup no longer stops Neo4j. The watchdog still checks every 5 minutes and restarts it if it is found stopped for any reason, restoring the `restart: always` policy. To manually restart:
 
 ```bash
 docker start <container-name>
@@ -235,13 +355,24 @@ Verify credentials:
 docker compose exec neo4j-backup aws s3 ls s3://<bucket>/ --endpoint-url <endpoint>
 ```
 
+### `Unknown function 'gds.version'`
+
+GDS did not load. Check the jar is in the image and that the container was restarted after any change:
+
+```bash
+docker compose exec neo4j ls -la /plugins
+docker compose exec neo4j cypher-shell -u neo4j -p <password> "RETURN gds.version();"
+```
+
+`/plugins` should hold `apoc.jar`, `open-gds-2.13.11.jar` and `neo4j-hot-backup-5.26.27.0.jar`. If the jar is missing, the `neo4j` service was pulled instead of built — rebuild it (`docker compose build neo4j`, or a full redeploy in Coolify).
+
 ### Wrong neo4j-admin version
 
-The backup script uses `neo4j/neo4j-admin:5.26-community-bullseye` to match DozerDB 5.26.27.0. If you upgrade DozerDB, update the version in [backup/backup.sh](backup/backup.sh).
+`restore.sh` uses `neo4j/neo4j-admin:5.26-community-bullseye` to match DozerDB 5.26.27.0. If you upgrade DozerDB, update `NEO4J_ADMIN_IMAGE` in [backup/lib.sh](backup/lib.sh), and rebuild the hot backup plugin jar for the new version.
 
-### Dump fails for a specific database
+### Backup fails for a specific database
 
-Check if the database is corrupted. The backup script continues with remaining databases and logs the failure. Check logs:
+`backup.all()` reports a `failed: <reason>` or `skipped: not available` row for that database. The script continues with the others, logs the row as `FAILED`, and exits non-zero. Check logs:
 
 ```bash
 docker compose logs neo4j-backup --since 24h | grep FAILED

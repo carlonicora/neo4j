@@ -16,13 +16,6 @@ assert_eq "neo4j/neo4j-admin:5.26-community-bullseye" \
   "$(unset NEO4J_ADMIN_IMAGE; source "${HERE}/../lib.sh"; echo "${NEO4J_ADMIN_IMAGE}")" \
   "image default set"
 
-echo "test: estimate_dump_size"
-setup_stub_path
-make_stub du 'echo "100	$2"'
-DATA_DIR="/data"
-assert_eq "102400" "$(estimate_dump_size neo4j)" "100KB => 102400 bytes"
-teardown_stub_path
-
 echo "test: s3_object_size"
 setup_stub_path
 S3_BUCKET="b" S3_ENDPOINT="https://e"
@@ -37,68 +30,53 @@ make_stub aws 'exit 0'   # nothing listed
 assert_eq "" "$(s3_object_size 2026-06-16/missing.dump)" "absent key => empty"
 teardown_stub_path
 
-echo "test: stream_dump_to_s3 success (bytes match)"
+echo "test: upload_dump_to_s3 success (sizes match)"
 setup_stub_path
-S3_BUCKET="b" S3_ENDPOINT="https://e" HOST_DATA_DIR="/host/data" DATA_DIR="/data"
-make_stub du 'echo "1	$2"'
-make_stub docker 'if [ "$1" = run ]; then printf "DUMPDATA"; fi'   # 8 bytes
+S3_BUCKET="b" S3_ENDPOINT="https://e"
+DUMP="$(mktemp "${TMPDIR:-/tmp}/dump.XXXXXX")"; printf DUMPDATA > "${DUMP}"   # 8 bytes
 make_stub aws '
 case "$1 $2" in
-  "s3 cp") cat >/dev/null; exit 0 ;;
+  "s3 cp") echo "$@" >> "${CP_LOG}"; exit 0 ;;
   "s3 ls") echo "2026-06-16 02:00:01      8 neo4j.dump"; exit 0 ;;
   "s3 rm") echo "$@" >> "${RM_LOG}"; exit 0 ;;
 esac'
+CP_LOG="$(mktemp "${TMPDIR:-/tmp}/cplog.XXXXXX")"; export CP_LOG
 RM_LOG="$(mktemp "${TMPDIR:-/tmp}/rmlog.XXXXXX")"; export RM_LOG
-stream_dump_to_s3 neo4j 2026-06-16; assert_success $? "matching bytes => success"
-assert_eq "" "$(cat "${RM_LOG}")" "no partial deletion on success"
-rm -f "${RM_LOG}"; teardown_stub_path
+upload_dump_to_s3 "${DUMP}" neo4j 2026-06-16; assert_success $? "matching sizes => success"
+if grep -q "s3://b/2026-06-16/neo4j.dump" "${CP_LOG}"; then assert_success 0 "uploaded as <date>/<db>.dump"; else assert_failure 0 "uploaded as <date>/<db>.dump"; fi
+assert_eq "" "$(cat "${RM_LOG}")" "no deletion on success"
+if [ -f "${DUMP}" ]; then assert_success 0 "local file untouched"; else assert_failure 0 "local file untouched"; fi
+rm -f "${CP_LOG}" "${RM_LOG}" "${DUMP}"; teardown_stub_path
 
-echo "test: stream_dump_to_s3 empty object deletes partial"
+echo "test: upload_dump_to_s3 size mismatch deletes partial"
 setup_stub_path
-S3_BUCKET="b" S3_ENDPOINT="https://e" HOST_DATA_DIR="/host/data" DATA_DIR="/data"
-make_stub du 'echo "1	$2"'
-make_stub docker 'if [ "$1" = run ]; then printf "DUMPDATA"; fi'
+S3_BUCKET="b" S3_ENDPOINT="https://e"
+DUMP="$(mktemp "${TMPDIR:-/tmp}/dump.XXXXXX")"; printf DUMPDATA > "${DUMP}"
 make_stub aws '
 case "$1 $2" in
-  "s3 cp") cat >/dev/null; exit 0 ;;
-  "s3 ls") echo "2026-06-16 02:00:01      0 neo4j.dump"; exit 0 ;;
+  "s3 cp") exit 0 ;;
+  "s3 ls") echo "2026-06-16 02:00:01      3 neo4j.dump"; exit 0 ;;
   "s3 rm") echo "$@" >> "${RM_LOG}"; exit 0 ;;
 esac'
 RM_LOG="$(mktemp "${TMPDIR:-/tmp}/rmlog.XXXXXX")"; export RM_LOG
-stream_dump_to_s3 neo4j 2026-06-16; assert_failure $? "empty object => failure"
+upload_dump_to_s3 "${DUMP}" neo4j 2026-06-16; assert_failure $? "size mismatch => failure"
 if grep -q "neo4j.dump" "${RM_LOG}"; then assert_success 0 "partial object deleted"; else assert_failure 0 "partial object deleted"; fi
-rm -f "${RM_LOG}"; teardown_stub_path
+rm -f "${RM_LOG}" "${DUMP}"; teardown_stub_path
 
-echo "test: stream_dump_to_s3 dump failure deletes partial"
+echo "test: upload_dump_to_s3 upload failure deletes partial"
 setup_stub_path
-S3_BUCKET="b" S3_ENDPOINT="https://e" HOST_DATA_DIR="/host/data" DATA_DIR="/data"
-make_stub du 'echo "1	$2"'
-make_stub docker 'exit 1'   # dump fails
+S3_BUCKET="b" S3_ENDPOINT="https://e"
+DUMP="$(mktemp "${TMPDIR:-/tmp}/dump.XXXXXX")"; printf DUMPDATA > "${DUMP}"
 make_stub aws '
 case "$1 $2" in
-  "s3 cp") cat >/dev/null; exit 0 ;;
-  "s3 rm") echo "$@" >> "${RM_LOG}"; exit 0 ;;
-esac'
-RM_LOG="$(mktemp "${TMPDIR:-/tmp}/rmlog.XXXXXX")"; export RM_LOG
-stream_dump_to_s3 neo4j 2026-06-16; assert_failure $? "dump failure => failure"
-if grep -q "neo4j.dump" "${RM_LOG}"; then assert_success 0 "partial deleted on dump failure"; else assert_failure 0 "partial deleted on dump failure"; fi
-rm -f "${RM_LOG}"; teardown_stub_path
-
-echo "test: stream_dump_to_s3 upload failure deletes partial"
-setup_stub_path
-S3_BUCKET="b" S3_ENDPOINT="https://e" HOST_DATA_DIR="/host/data" DATA_DIR="/data"
-make_stub du 'echo "1	$2"'
-make_stub docker 'if [ "$1" = run ]; then printf "DUMPDATA"; fi'
-make_stub aws '
-case "$1 $2" in
-  "s3 cp") cat >/dev/null; exit 1 ;;
+  "s3 cp") exit 1 ;;
   "s3 ls") echo "2026-06-16 02:00:01      8 neo4j.dump"; exit 0 ;;
   "s3 rm") echo "$@" >> "${RM_LOG}"; exit 0 ;;
 esac'
 RM_LOG="$(mktemp "${TMPDIR:-/tmp}/rmlog.XXXXXX")"; export RM_LOG
-stream_dump_to_s3 neo4j 2026-06-16; assert_failure $? "upload failure => failure"
+upload_dump_to_s3 "${DUMP}" neo4j 2026-06-16; assert_failure $? "upload failure => failure"
 if grep -q "neo4j.dump" "${RM_LOG}"; then assert_success 0 "partial deleted on upload failure"; else assert_failure 0 "partial deleted on upload failure"; fi
-rm -f "${RM_LOG}"; teardown_stub_path
+rm -f "${RM_LOG}" "${DUMP}"; teardown_stub_path
 
 echo "test: drain_local_backlog removes verified dir"
 setup_stub_path
