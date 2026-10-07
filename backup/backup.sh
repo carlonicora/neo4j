@@ -55,7 +55,13 @@ if [ ! -d "${BACKUP_ROOT}" ]; then
 fi
 
 log "=== Starting hot backup (Neo4j stays online) ==="
-if s3_configured; then log "S3 configured: dumps go to s3://${S3_BUCKET}/${TODAY}/"; else log "Local mode: dumps go to ${BACKUP_ROOT}/${TODAY}/"; fi
+if s3_configured; then
+  log "S3 configured: dumps go to s3://${S3_BUCKET}/${TODAY}/"
+  # The settings this run's uploads use (none of them is a secret).
+  log "AWS CLI: AWS_REQUEST_CHECKSUM_CALCULATION=${AWS_REQUEST_CHECKSUM_CALCULATION:-<unset>} AWS_RESPONSE_CHECKSUM_VALIDATION=${AWS_RESPONSE_CHECKSUM_VALIDATION:-<unset>} AWS_RETRY_MODE=${AWS_RETRY_MODE:-<unset>} AWS_MAX_ATTEMPTS=${AWS_MAX_ATTEMPTS:-<unset>}"
+else
+  log "Local mode: dumps go to ${BACKUP_ROOT}/${TODAY}/"
+fi
 
 # Never leave a FIFO or a background upload behind, whatever happens.
 STREAM_PIDS=""
@@ -103,14 +109,44 @@ run_database_to() {
   return 0
 }
 
+# start_upload_debug_log <db>: with BACKUP_AWS_DEBUG on, create an empty 0600 debug log for
+# <db>'s upload and echo its path. Echoes nothing when off or when the file cannot be created
+# (the upload then runs as usual: logging never decides success or failure).
+start_upload_debug_log() {
+  local db="$1" file
+  aws_debug_enabled || return 0
+  file="${BACKUP_ROOT}/logs/${TODAY}/${db}-upload.log"
+  if mkdir -p "${file%/*}" 2>/dev/null && (umask 077; : > "${file}") 2>/dev/null && chmod 600 "${file}" 2>/dev/null; then
+    echo "${file}"
+  else
+    log "  WARNING: cannot create upload debug log ${file}, uploading without it" >&2
+  fi
+}
+
+# report_upload_debug_log <file>: after a failed upload, copy the lines of the debug log that
+# explain it into the main log, and say where the full log is. The file is kept.
+report_upload_debug_log() {
+  local file="$1" lines
+  lines=$(grep -iE 'traceback|exception|error|retry|retries|closed|timeout|timed out|status code[^0-9]*[45][0-9]{2}|HTTP/1\.[01]" [45][0-9]{2}' "${file}" 2>/dev/null | tail -40) || true
+  log "  --- aws upload debug excerpt (last 40 matching lines) ---"
+  if [ -n "${lines}" ]; then
+    printf '%s\n' "${lines}" | sed 's/^/    | /' || true
+  else
+    echo "    | (no matching lines)"
+  fi
+  log "  --- full aws debug log: ${file} ---"
+}
+
 # stream_to_s3 <db>: dump <db> through a FIFO straight into S3 as <today>/<db>.dump.
 # Nothing touches the local disk. On any failure the S3 object and any open multipart
 # upload are removed. Sets DUMP_BYTES / FAIL_REASON. rc 0/1.
+# With BACKUP_AWS_DEBUG on, aws runs with --debug and its stderr goes to
+# logs/<today>/<db>-upload.log, kept (and excerpted into the main log) only on failure.
 stream_to_s3() {
   local db="$1"
   local name=".stream-${db}.fifo"
   local fifo="${BACKUP_ROOT}/${name}" key="${TODAY}/${db}.dump"
-  local est aws_pid aws_rc=0 remote
+  local est aws_pid aws_rc=0 remote debug_log
   DUMP_BYTES=""; FAIL_REASON=""
 
   est=$(estimate_dump_size "${db}") || true
@@ -126,8 +162,14 @@ stream_to_s3() {
     return 1
   fi
 
-  aws s3 cp - "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --no-progress \
-    --expected-size "${est}" < "${fifo}" &
+  debug_log=$(start_upload_debug_log "${db}") || debug_log=""
+  if [ -n "${debug_log}" ]; then
+    aws s3 cp - "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --no-progress \
+      --expected-size "${est}" --debug < "${fifo}" 2>> "${debug_log}" &
+  else
+    aws s3 cp - "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --no-progress \
+      --expected-size "${est}" < "${fifo}" &
+  fi
   aws_pid=$!
   STREAM_PIDS="${aws_pid}"
 
@@ -156,7 +198,12 @@ stream_to_s3() {
 
   if [ -n "${FAIL_REASON}" ]; then
     discard_s3_object "${key}"
+    [ -z "${debug_log}" ] || report_upload_debug_log "${debug_log}"
     return 1
+  fi
+  if [ -n "${debug_log}" ]; then
+    rm -f "${debug_log}" 2>/dev/null || true
+    rmdir "${debug_log%/*}" 2>/dev/null || true
   fi
   return 0
 }
@@ -198,6 +245,9 @@ for db in ${ONLINE}; do
     fi
   fi
 done
+
+# Upload debug logs are kept for 14 days. Never affects the outcome of the run.
+prune_upload_debug_logs "${BACKUP_ROOT}/logs" "${TODAY}" 14 | while IFS= read -r d; do log "Removed old upload debug logs: logs/${d}"; done || true
 
 # --- Phase 3: Apply retention, only after a fully successful backup ---
 if [ "${DUMP_FAILED}" -ne 0 ]; then

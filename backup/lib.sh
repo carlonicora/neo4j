@@ -131,6 +131,29 @@ retention_keep_dates() {
   return 0
 }
 
+# prune_upload_debug_logs <logs dir> <today> <days>: delete the YYYY-MM-DD folders under
+# <logs dir> more than <days> days older than <today>, echoing each deleted name. Anything
+# else in <logs dir> is left alone. Always rc 0.
+prune_upload_debug_logs() {
+  local dir="$1" today="$2" keep="$3" path name now
+  [ -d "${dir}" ] || return 0
+  now=$(date_to_days "${today}")
+  for path in "${dir}"/????-??-??; do
+    [ -d "${path}" ] || continue
+    name="${path##*/}"
+    printf '%s\n' "${name}" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || continue
+    if [ $(( now - $(date_to_days "${name}") )) -gt "${keep}" ]; then
+      rm -rf "${path:?}" 2>/dev/null && echo "${name}"
+    fi
+  done
+  return 0
+}
+
+# True when BACKUP_AWS_DEBUG asks for the upload debug log ("1" or "true").
+aws_debug_enabled() {
+  case "${BACKUP_AWS_DEBUG:-}" in 1|true|TRUE|True) return 0 ;; *) return 1 ;; esac
+}
+
 # missing_databases "<dump names present>" "<databases>": echo (space separated) every
 # database without a <db>.dump in the first list. Empty output = the date is complete.
 missing_databases() {

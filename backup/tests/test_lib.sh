@@ -26,6 +26,16 @@ if grep -q UNRELATED "${ENVF}"; then assert_failure 0 "unrelated variables exclu
 assert_eq "600" "$(stat -f %Lp "${ENVF}" 2>/dev/null || stat -c %a "${ENVF}")" "file is 0600 (holds the password)"
 rm -f "${ENVF}"
 
+echo "test: write_backup_env_file passes the aws-cli checksum, retry and debug settings to cron"
+ENVF="$(mktemp "${TMPDIR:-/tmp}/envf.XXXXXX")"
+( export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
+    AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=10 BACKUP_AWS_DEBUG=1; write_backup_env_file "${ENVF}" )
+( set -a; source "${ENVF}"; set +a
+  [ "${AWS_REQUEST_CHECKSUM_CALCULATION:-}" = when_required ] && [ "${AWS_RESPONSE_CHECKSUM_VALIDATION:-}" = when_required ] \
+    && [ "${AWS_RETRY_MODE:-}" = standard ] && [ "${AWS_MAX_ATTEMPTS:-}" = 10 ] && [ "${BACKUP_AWS_DEBUG:-}" = 1 ] )
+assert_success $? "AWS_REQUEST/RESPONSE_CHECKSUM_*, AWS_RETRY_MODE, AWS_MAX_ATTEMPTS, BACKUP_AWS_DEBUG written"
+rm -f "${ENVF}"
+
 echo "test: date_to_days"
 assert_eq "0" "$(date_to_days 1970-01-01)" "epoch day is 0"
 assert_eq "20732" "$(date_to_days 2026-10-06)" "2026-10-06 is day 20732 (a Tuesday)"

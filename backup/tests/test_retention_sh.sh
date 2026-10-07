@@ -33,6 +33,17 @@ logged "Keeping local: 2026-10-07 (daily)" "log names the rule"
 logged "Removing local: 2026-10-05 (incomplete, missing: system)" "log names the missing database"
 rm -rf "${WORK}"; teardown_stub_path
 
+echo "test: local mode ignores the logs/ folder of upload debug logs"
+setup_stub_path; pin_today
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/ret.XXXXXX")"
+mkdate 2026-10-07 neo4j
+mkdir -p "${WORK}/logs/2026-01-01"; printf x > "${WORK}/logs/2026-01-01/neo4j-upload.log"
+BACKUP_DATABASES="neo4j" BACKUP_RETENTION="daily=3" run_local
+assert_success $? "local run succeeds"
+exists logs/2026-01-01 "logs/ and its date folders untouched"
+if grep -q "logs" "${WORK}/out.log"; then assert_failure 0 "logs/ not mentioned"; else assert_success 0 "logs/ not mentioned"; fi
+rm -rf "${WORK}"; teardown_stub_path
+
 echo "test: S3 production case: daily=14 on 2026-10-07"
 setup_stub_path; pin_today
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ret.XXXXXX")"

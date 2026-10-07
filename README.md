@@ -192,6 +192,11 @@ HOST_BACKUP_DIR=/data/coolify/applications/<app-id>/data-backup
 | `AWS_ACCESS_KEY_ID`     | S3 access key                                 | For S3 upload |
 | `AWS_SECRET_ACCESS_KEY` | S3 secret key                                 | For S3 upload |
 | `AWS_DEFAULT_REGION`    | S3 region (default: `us-east-1`)              | No            |
+| `AWS_REQUEST_CHECKSUM_CALCULATION` | aws-cli upload checksums (default `when_required`, see [S3 upload reliability](#s3-upload-reliability)) | No |
+| `AWS_RESPONSE_CHECKSUM_VALIDATION` | aws-cli response checksum checks (default `when_required`) | No |
+| `AWS_RETRY_MODE`        | aws-cli retry mode (default `standard`)       | No            |
+| `AWS_MAX_ATTEMPTS`      | aws-cli attempts per request, first try included (default `10`) | No |
+| `BACKUP_AWS_DEBUG`      | `1` or `true`: keep an aws `--debug` log of failed uploads (see [Upload debug log](#upload-debug-log)) | No |
 
 If neither `HOST_BACKUP_DIR` nor S3 is set, backups are silently skipped. If S3 variables are not set, only local backups are created. `HOST_DATA_DIR` is still needed by `restore.sh`. The backup service also needs `NEO4J_AUTH` (passed through from `.env`) to call the backup procedures.
 
@@ -324,6 +329,52 @@ ls -la "${HOST_BACKUP_DIR}" 2>/dev/null
 
 Expected: one object per database, non-empty; `--info` prints a valid file count, byte
 count, and format; and no `.dump`, `.partial-*` or `.stream-*` file under `HOST_BACKUP_DIR`.
+
+### S3 upload reliability
+
+The backup image ships aws-cli 2.27. Since 2.23 the AWS CLI adds CRC checksums to every upload
+by default. AWS S3 accepts them; many S3-compatible stores (Hetzner Object Storage among them)
+mishandle them, which shows up as failed or broken uploads on some nights, including aws-cli
+internal errors such as `argument of type 'NoneType' is not iterable`. The compose file sets:
+
+| Variable | Default | Why |
+|---|---|---|
+| `AWS_REQUEST_CHECKSUM_CALCULATION` | `when_required` | send checksums only when the API requires them (the pre-2.23 behaviour) |
+| `AWS_RESPONSE_CHECKSUM_VALIDATION` | `when_required` | validate response checksums only when required |
+| `AWS_RETRY_MODE` | `standard` | retry dropped connections, throttling and 5xx answers with backoff |
+| `AWS_MAX_ATTEMPTS` | `10` | attempts per request (each multipart part is retried on its own), so a connection the provider closes mid upload does not fail the night |
+
+Override any of them in `.env`. Each S3-mode run logs the values it used, once, at the start:
+
+```
+[backup][2026-10-07] 02:00:00 AWS CLI: AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=10
+```
+
+### Upload debug log
+
+When uploads fail and the backup log does not say why, set `BACKUP_AWS_DEBUG=1` (or `true`)
+and restart the backup service. Each upload then runs with `aws --debug`, and its output goes
+to `data-backup/logs/<date>/<database>-upload.log` on the host (`/backups/logs/...` in the
+container).
+
+- **Upload succeeds**: the file is deleted (and the date folder, when empty). Only failed nights keep logs.
+- **Upload fails**: the file is kept, and the backup log gets the last 40 lines that mention a
+  traceback, exception, error, retry, closed connection, timeout or a 4xx/5xx status, followed
+  by the path of the full log.
+- Date folders under `logs/` older than 14 days are deleted at the end of every run. Retention
+  never touches `logs/`.
+- The file holds request headers, so it is created `0600`. Do not paste it publicly unedited.
+
+The backup outcome is the same with or without the debug log. To read a kept log, start from
+the end: the `Traceback` and the exception name (for example `ConnectionClosedError`) say what
+failed, and the lines just before it show which request (`partNumber=...` for a multipart part)
+and which HTTP status the provider returned. Lines with `retry` show how many attempts were made.
+
+```bash
+grep -inE 'traceback|exception|retry|status code|HTTP/1.1" [45]' data-backup/logs/<date>/neo4j-upload.log | tail -40
+```
+
+Turn it off again (`BACKUP_AWS_DEBUG=`) once the cause is found: debug output is large.
 
 ## Manual Operations
 

@@ -153,4 +153,12 @@ services:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-east-1}
+      # aws-cli >= 2.23 sends CRC checksums by default, which S3-compatible stores (Hetzner) mishandle
+      - AWS_REQUEST_CHECKSUM_CALCULATION=${AWS_REQUEST_CHECKSUM_CALCULATION:-when_required}
+      - AWS_RESPONSE_CHECKSUM_VALIDATION=${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}
+      # Retry dropped connections and 5xx answers during multipart uploads
+      - AWS_RETRY_MODE=${AWS_RETRY_MODE:-standard}
+      - AWS_MAX_ATTEMPTS=${AWS_MAX_ATTEMPTS:-10}
+      # "1" or "true": keep an aws --debug log of failed uploads in data-backup/logs/<date>/ (see README)
+      - BACKUP_AWS_DEBUG=${BACKUP_AWS_DEBUG:-}
     restart: always

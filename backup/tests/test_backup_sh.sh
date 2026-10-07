@@ -40,7 +40,13 @@ esac'
   make_stub aws '
 obj() { printf "%s" "${S3_DIR}/$(printf "%s" "${1#s3://b/}" | tr / _)"; }
 case "$1 $2" in
-  "s3 cp") echo "$@" >> "${CP_LOG}"; cat > "$(obj "$4")"; [ "${AWS_CP_FAIL:-0}" = 1 ] && exit 1; exit 0 ;;
+  "s3 cp") echo "$@" >> "${CP_LOG}"; cat > "$(obj "$4")"
+           case " $* " in *" --debug "*)
+             echo "2026-10-07 02:00:01,000 - MainThread - botocore.endpoint - DEBUG - Making request for OperationModel(name=UploadPart)" >&2
+             echo "2026-10-07 02:00:02,000 - MainThread - urllib3.connectionpool - DEBUG - \"PUT /b/key?partNumber=59 HTTP/1.1\" 503 0" >&2
+             [ "${AWS_CP_FAIL:-0}" = 1 ] && echo "botocore.exceptions.ConnectionClosedError: Connection was closed before we received a valid response" >&2 ;;
+           esac
+           [ "${AWS_CP_FAIL:-0}" = 1 ] && exit 1; exit 0 ;;
   "s3 ls") f=$(obj "$3"); [ -f "$f" ] || exit 1
            echo "2026-10-07 02:00:01 ${S3_SIZE_OVERRIDE:-$(wc -c < "$f" | tr -d " ")} $(basename "$3")"; exit 0 ;;
   "s3 rm") echo "$3" >> "${RM_LOG}"; rm -f "$(obj "$3")"; exit 0 ;;
@@ -59,7 +65,8 @@ esac'
   RETENTION_SCRIPT="${WORK}/retention-stub.sh"
   printf '#!/bin/bash\necho "ran with: ${BACKUP_DATABASES}" >> "${RET_LOG}"\nexit 0\n' > "${RETENTION_SCRIPT}"; chmod +x "${RETENTION_SCRIPT}"
   export RETENTION_SCRIPT
-  unset FAIL_DB AWS_CP_FAIL S3_SIZE_OVERRIDE TIMEOUT_EXPIRES BACKUP_DB_TIMEOUT
+  unset FAIL_DB AWS_CP_FAIL S3_SIZE_OVERRIDE TIMEOUT_EXPIRES BACKUP_DB_TIMEOUT BACKUP_AWS_DEBUG
+  unset AWS_REQUEST_CHECKSUM_CALCULATION AWS_RESPONSE_CHECKSUM_VALIDATION AWS_RETRY_MODE AWS_MAX_ATTEMPTS
 }
 teardown_backup_stubs() { rm -rf "${WORK}"; }
 
@@ -147,6 +154,81 @@ if grep -q "s3://b/${TODAY}/neo4j.dump" "${RM_LOG}"; then assert_success 0 "obje
 logged "upload failed (aws exit 1)" "aws failure logged"
 assert_eq "0" "$(find "${BACKUP_ROOT}" -mindepth 1 | wc -l | tr -d ' ')" "nothing kept locally"
 if [ -f "${RET_LOG}" ]; then assert_failure 0 "retention not run"; else assert_success 0 "retention not run"; fi
+teardown_backup_stubs; teardown_stub_path
+
+echo "test: S3 mode logs the effective aws-cli checksum and retry settings"
+setup_stub_path; setup_backup_stubs
+with_dbs "neo4j|online"
+export AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=10
+run_s3; RC=$?
+assert_success ${RC} "run succeeds"
+logged "AWS CLI: AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=10" "the four settings logged"
+assert_eq "1" "$(grep -c "AWS CLI:" "${WORK}/out.log")" "logged once per run"
+teardown_backup_stubs; teardown_stub_path
+
+echo "test: BACKUP_AWS_DEBUG off: no --debug, no logs folder"
+setup_stub_path; setup_backup_stubs
+with_dbs "neo4j|online"
+run_s3; RC=$?
+assert_success ${RC} "run succeeds"
+if grep -q -- "--debug" "${CP_LOG}"; then assert_failure 0 "no --debug passed"; else assert_success 0 "no --debug passed"; fi
+if [ -e "${BACKUP_ROOT}/logs" ]; then assert_failure 0 "no logs folder created"; else assert_success 0 "no logs folder created"; fi
+teardown_backup_stubs; teardown_stub_path
+
+echo "test: BACKUP_AWS_DEBUG on, upload succeeds: --debug passed, no log left"
+setup_stub_path; setup_backup_stubs
+with_dbs "neo4j|online"
+export BACKUP_AWS_DEBUG=1
+run_s3; RC=$?
+assert_success ${RC} "run succeeds"
+if grep -q -- "--debug" "${CP_LOG}"; then assert_success 0 "--debug passed"; else assert_failure 0 "--debug passed"; fi
+assert_eq "0" "$(find "${BACKUP_ROOT}/logs" -type f 2>/dev/null | wc -l | tr -d ' ')" "debug log deleted"
+if [ -e "${BACKUP_ROOT}/logs/${TODAY}" ]; then assert_failure 0 "empty date folder removed"; else assert_success 0 "empty date folder removed"; fi
+if grep -q "partNumber" "${WORK}/out.log"; then assert_failure 0 "debug output kept out of the main log"; else assert_success 0 "debug output kept out of the main log"; fi
+teardown_backup_stubs; teardown_stub_path
+
+echo "test: BACKUP_AWS_DEBUG on, upload fails: log kept, excerpt in the main log, outcome unchanged"
+setup_stub_path; setup_backup_stubs
+with_dbs "neo4j|online"
+export BACKUP_AWS_DEBUG=true AWS_CP_FAIL=1
+run_s3; RC=$?
+assert_failure ${RC} "aws failure => non-zero exit"
+DBG="${BACKUP_ROOT}/logs/${TODAY}/neo4j-upload.log"
+if grep -q "ConnectionClosedError" "${DBG}" 2>/dev/null; then assert_success 0 "debug log kept with aws stderr"; else assert_failure 0 "debug log kept with aws stderr"; fi
+assert_eq "600" "$(stat -f %Lp "${DBG}" 2>/dev/null || stat -c %a "${DBG}")" "debug log is 0600"
+logged "upload failed (aws exit 1)" "failure reason unchanged"
+logged "aws upload debug excerpt" "excerpt header in the main log"
+logged "| botocore.exceptions.ConnectionClosedError: Connection was closed" "exception line excerpted"
+logged "partNumber=59 HTTP/1.1\" 503" "5xx status line excerpted"
+if grep -q "Making request for OperationModel" "${WORK}/out.log"; then assert_failure 0 "unrelated debug lines left out"; else assert_success 0 "unrelated debug lines left out"; fi
+logged "full aws debug log: ${DBG}" "log path given"
+if grep -q "s3://b/${TODAY}/neo4j.dump" "${RM_LOG}"; then assert_success 0 "object still discarded"; else assert_failure 0 "object still discarded"; fi
+teardown_backup_stubs; teardown_stub_path
+
+echo "test: upload debug log folders older than 14 days are pruned, other entries kept"
+setup_stub_path; setup_backup_stubs
+with_dbs "neo4j|online"
+OLD=$(date -d "-15 days" +%Y-%m-%d 2>/dev/null || date -v-15d +%Y-%m-%d)
+EDGE=$(date -d "-14 days" +%Y-%m-%d 2>/dev/null || date -v-14d +%Y-%m-%d)
+mkdir -p "${BACKUP_ROOT}/logs/${OLD}" "${BACKUP_ROOT}/logs/${EDGE}" "${BACKUP_ROOT}/logs/notes"
+printf x > "${BACKUP_ROOT}/logs/${OLD}/neo4j-upload.log"; printf x > "${BACKUP_ROOT}/logs/${EDGE}/neo4j-upload.log"
+printf x > "${BACKUP_ROOT}/logs/README"
+run_s3; RC=$?
+assert_success ${RC} "run succeeds"
+if [ -d "${BACKUP_ROOT}/logs/${OLD}" ]; then assert_failure 0 "15-day-old folder removed"; else assert_success 0 "15-day-old folder removed"; fi
+if [ -d "${BACKUP_ROOT}/logs/${EDGE}" ]; then assert_success 0 "14-day-old folder kept"; else assert_failure 0 "14-day-old folder kept"; fi
+if [ -d "${BACKUP_ROOT}/logs/notes" ] && [ -f "${BACKUP_ROOT}/logs/README" ]; then assert_success 0 "non-date entries kept"; else assert_failure 0 "non-date entries kept"; fi
+logged "Removed old upload debug logs: logs/${OLD}" "pruning logged"
+teardown_backup_stubs; teardown_stub_path
+
+echo "test: pruning also runs on a failed night"
+setup_stub_path; setup_backup_stubs
+with_dbs "neo4j|online"
+export AWS_CP_FAIL=1
+mkdir -p "${BACKUP_ROOT}/logs/2020-01-01"
+run_s3; RC=$?
+assert_failure ${RC} "failure => non-zero exit"
+if [ -d "${BACKUP_ROOT}/logs/2020-01-01" ]; then assert_failure 0 "old folder removed"; else assert_success 0 "old folder removed"; fi
 teardown_backup_stubs; teardown_stub_path
 
 echo "test: S3 mode without a visible store fails that database (no --expected-size, no upload)"
