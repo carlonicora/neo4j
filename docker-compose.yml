@@ -144,6 +144,8 @@ services:
       - NEO4J_AUTH=${NEO4J_AUTH}
       - HOST_DATA_DIR=${HOST_DATA_DIR:-}
       - HOST_BACKUP_DIR=${HOST_BACKUP_DIR:-}
+      # Cron expression for the nightly backup, server timezone (default "0 2 * * *", see README)
+      - BACKUP_SCHEDULE=${BACKUP_SCHEDULE:-}
       # Retention policy, e.g. daily=14 or daily=7,weekly=4,monthly=12 (see README)
       - BACKUP_RETENTION=${BACKUP_RETENTION:-}
       # Max seconds for one database's backup (default 21600 = 6 h)

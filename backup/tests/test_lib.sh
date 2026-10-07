@@ -36,6 +36,20 @@ ENVF="$(mktemp "${TMPDIR:-/tmp}/envf.XXXXXX")"
 assert_success $? "AWS_REQUEST/RESPONSE_CHECKSUM_*, AWS_RETRY_MODE, AWS_MAX_ATTEMPTS, BACKUP_AWS_DEBUG written"
 rm -f "${ENVF}"
 
+echo "test: resolve_backup_schedule"
+assert_eq "0 2 * * *" "$(resolve_backup_schedule "" 2>/dev/null)" "empty => default"
+resolve_backup_schedule "" >/dev/null 2>&1; assert_success $? "empty => rc 0"
+for v in "0 2 * * *" "30 4 * * *" "*/15 1-5 * * 1,3"; do
+  assert_eq "${v}" "$(resolve_backup_schedule "${v}" 2>/dev/null)" "'${v}' accepted as is"
+  resolve_backup_schedule "${v}" >/dev/null 2>&1; assert_success $? "'${v}' => rc 0"
+done
+for v in "0 2 * *" "0 2 * * * *" "abc" "0 2 * * *; rm -rf /"; do
+  assert_eq "0 2 * * *" "$(resolve_backup_schedule "${v}" 2>/dev/null)" "'${v}' rejected => default"
+  resolve_backup_schedule "${v}" >/dev/null 2>&1; assert_failure $? "'${v}' => rc 1"
+  ERR="$(resolve_backup_schedule "${v}" 2>&1 >/dev/null)"
+  if [ -n "${ERR}" ]; then assert_success 0 "'${v}' => reason on stderr"; else assert_failure 0 "'${v}' => reason on stderr"; fi
+done
+
 echo "test: date_to_days"
 assert_eq "0" "$(date_to_days 1970-01-01)" "epoch day is 0"
 assert_eq "20732" "$(date_to_days 2026-10-06)" "2026-10-06 is day 20732 (a Tuesday)"

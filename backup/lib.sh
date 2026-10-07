@@ -22,6 +22,30 @@ write_backup_env_file() {
 }
 
 # ---------------------------------------------------------------------------
+# Backup schedule (BACKUP_SCHEDULE): a standard 5-field cron expression, server timezone.
+# ---------------------------------------------------------------------------
+SCHEDULE_DEFAULT="0 2 * * *"
+
+# resolve_backup_schedule <value>: echo the cron expression to install.
+# Empty => the default, rc 0. Valid (exactly 5 whitespace-separated fields, each made only of
+# digits, *, /, , and -) => the value with whitespace normalised, rc 0. Anything else => the
+# default, rc 1, with the reason on stderr (the backups must still run).
+resolve_backup_schedule() {
+  local spec="$1" f1 f2 f3 f4 f5 extra
+  if [ -z "${spec//[[:space:]]/}" ]; then echo "${SCHEDULE_DEFAULT}"; return 0; fi
+  # Whole-string character check first: also rejects newlines, ; and anything a crontab line could misread.
+  case "${spec}" in
+    *[!0-9*/,[:blank:]-]*) echo "contains characters other than digits, *, /, , and -" >&2; echo "${SCHEDULE_DEFAULT}"; return 1 ;;
+  esac
+  read -r f1 f2 f3 f4 f5 extra <<< "${spec}"
+  if [ -z "${f5}" ] || [ -n "${extra}" ]; then
+    echo "needs exactly 5 fields (minute hour day-of-month month day-of-week)" >&2
+    echo "${SCHEDULE_DEFAULT}"; return 1
+  fi
+  echo "${f1} ${f2} ${f3} ${f4} ${f5}"
+}
+
+# ---------------------------------------------------------------------------
 # Retention policy (BACKUP_RETENTION). Rules are calendar windows counted back from
 # today, today included, applied to COMPLETE backup dates only:
 #   last=N      the N newest complete dates

@@ -7,10 +7,16 @@ set -euo pipefail
 source /usr/local/bin/lib.sh
 write_backup_env_file /etc/environment.backup || true
 
-# Create cron job - run at 2:00 AM daily
-echo "0 2 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1" > /etc/crontabs/root
+# Create cron job on BACKUP_SCHEDULE (default 0 2 * * *, server timezone).
+# An invalid value is rejected and the default is used, so backups still run.
+SCHEDULE=$(resolve_backup_schedule "${BACKUP_SCHEDULE:-}" 2>/dev/null) || true
+SCHEDULE_ERROR=$(resolve_backup_schedule "${BACKUP_SCHEDULE:-}" 2>&1 >/dev/null) || true
+if [ -n "${SCHEDULE_ERROR}" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: BACKUP_SCHEDULE='${BACKUP_SCHEDULE}' rejected: ${SCHEDULE_ERROR}. Using the default '${SCHEDULE}'."
+fi
+echo "${SCHEDULE} /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1" > /etc/crontabs/root
 
-echo "$(date '+%Y-%m-%d %H:%M:%S') Backup service started. Cron scheduled for 2:00 AM daily."
+echo "$(date '+%Y-%m-%d %H:%M:%S') Backup service started. Cron schedule: '${SCHEDULE}' (server timezone)."
 echo "Manual trigger: docker exec <container> /usr/local/bin/backup.sh"
 
 # Safety watchdog: ensure neo4j is running every 5 minutes

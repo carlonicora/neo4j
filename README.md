@@ -98,7 +98,7 @@ Restore still stops Neo4j, loads, and restarts it. The first start after a load 
 
 ### Automatic use
 
-The scheduled job in the `neo4j-backup` container ([`backup/backup.sh`](backup/backup.sh)) uses the plugin. Neo4j is never stopped. Every night at 2:00 AM it:
+The scheduled job in the `neo4j-backup` container ([`backup/backup.sh`](backup/backup.sh)) uses the plugin. Neo4j is never stopped. Every night at 2:00 AM (or on `BACKUP_SCHEDULE`, see [How It Works](#how-it-works)) it:
 
 1. Lists the databases with `SHOW DATABASES` through `cypher-shell`, using the `NEO4J_AUTH` credentials passed to the backup service. A database that is not `online` is logged as `FAILED`.
 2. Backs up each online database, one at a time, with `CALL backup.databaseTo(...)`:
@@ -185,6 +185,7 @@ HOST_BACKUP_DIR=/data/coolify/applications/<app-id>/data-backup
 | ----------------------- | --------------------------------------------- | ------------- |
 | `HOST_DATA_DIR`         | Absolute host path to `neo4j/data` directory  | For restore   |
 | `HOST_BACKUP_DIR`       | Absolute host path to `data-backup` directory | For backups   |
+| `BACKUP_SCHEDULE`       | Cron expression for the backup, server timezone (default `0 2 * * *`, see [How It Works](#how-it-works)) | No, has default |
 | `BACKUP_RETENTION`      | Which backups to keep, e.g. `daily=7,weekly=4,monthly=12` (see [Retention Policy](#retention-policy)) | No, has default |
 | `BACKUP_DB_TIMEOUT`     | Max seconds for one database's backup (default `21600`, 6 hours) | No            |
 | `S3_BUCKET`             | S3 bucket name                                | For S3 upload |
@@ -215,7 +216,17 @@ In the Coolify dashboard, go to your service's settings and look at the volume m
 
 DozerDB is Neo4j Community Edition, which has no online backup of its own. The [Hot Backup Plugin](#hot-backup-plugin) adds one, so the nightly job runs with the database online.
 
-The backup runs daily at **2:00 AM** (server timezone) and follows this sequence:
+The backup runs daily at **2:00 AM** by default. Set `BACKUP_SCHEDULE` to a standard 5-field cron expression (minute hour day-of-month month day-of-week) to change it. Times are in the server's timezone: the container reads the host's `/etc/localtime`.
+
+```bash
+BACKUP_SCHEDULE="30 4 * * *"     # 04:30 every day
+BACKUP_SCHEDULE="0 1 * * 1-5"    # 01:00 Monday to Friday
+BACKUP_SCHEDULE="0 */6 * * *"    # every 6 hours
+```
+
+Each field may contain only digits, `*`, `/`, `,` and `-`. Any other value is rejected at startup with an `ERROR` line in the container log and the default `0 2 * * *` is used, so backups keep running. The startup line `Cron schedule: '...'` shows the schedule actually installed.
+
+Each run follows this sequence:
 
 1. **List** the databases with `SHOW DATABASES`; any that is not online is a failure
 2. **Back up** each online database with `CALL backup.databaseTo(...)` while Neo4j keeps serving queries: streamed straight to S3 through a FIFO (no local copy), or filed by date locally
