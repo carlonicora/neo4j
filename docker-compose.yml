@@ -146,6 +146,8 @@ services:
       - HOST_BACKUP_DIR=${HOST_BACKUP_DIR:-}
       # Retention policy, e.g. daily=14 or daily=7,weekly=4,monthly=12 (see README)
       - BACKUP_RETENTION=${BACKUP_RETENTION:-}
+      # Max seconds for one database's backup (default 21600 = 6 h)
+      - BACKUP_DB_TIMEOUT=${BACKUP_DB_TIMEOUT:-}
       - S3_BUCKET=${S3_BUCKET:-}
       - S3_ENDPOINT=${S3_ENDPOINT:-}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}

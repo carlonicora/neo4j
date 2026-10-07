@@ -34,12 +34,13 @@ The output is a normal `.dump` file. `neo4j-admin database load` and the existin
 
 ### What it does
 
-The plugin adds two procedures. Both need admin rights.
+The plugin adds these procedures. All need admin rights.
 
 | Procedure | What it does |
 | --- | --- |
 | `CALL backup.database('neo4j')` | Backs up one database. Throws if the database does not exist or is not running. |
 | `CALL backup.all()` | Backs up every database, `system` included. Never throws for a single database: each one gets its own row. |
+| `CALL backup.databaseTo('neo4j', 'name.dump')` | Backs up one database to `server.backup.directory/<name>`. If that path is an existing FIFO, the dump is streamed into it (the call waits for a reader). Used by the nightly job. Throws on failure. |
 
 Each row has these columns:
 
@@ -99,12 +100,14 @@ Restore still stops Neo4j, loads, and restarts it. The first start after a load 
 
 The scheduled job in the `neo4j-backup` container ([`backup/backup.sh`](backup/backup.sh)) uses the plugin. Neo4j is never stopped. Every night at 2:00 AM it:
 
-1. Runs `CALL backup.all()` inside the Neo4j container through `cypher-shell`, using the `NEO4J_AUTH` credentials passed to the backup service.
-2. Reads the rows. Every row must say `ok`; any other status is logged as `FAILED` and makes the job exit non-zero, while the other databases are still processed.
-3. Files each dump. In local mode it moves the file to `data-backup/<date>/<database>.dump`. In S3 mode it uploads it to `<date>/<database>.dump`, checks the object size matches, then deletes the local file. If an upload fails, the dump stays under `data-backup/<date>/` and the next run's retention step retries it.
-4. Applies the retention policy as before.
+1. Lists the databases with `SHOW DATABASES` through `cypher-shell`, using the `NEO4J_AUTH` credentials passed to the backup service. A database that is not `online` is logged as `FAILED`.
+2. Backs up each online database, one at a time, with `CALL backup.databaseTo(...)`:
+   - **S3 mode**: creates a FIFO (`data-backup/.stream-<database>.fifo`), starts `aws s3 cp - s3://<bucket>/<date>/<database>.dump --expected-size <estimate>` reading from it, and has the plugin stream the dump into it. Nothing is written to disk. The estimate comes from the database's store size under `/data`; without it the AWS CLI caps a streamed upload well below a large dump.
+   - **Local mode**: the plugin writes `data-backup/.partial-<database>.dump`, which is moved to `data-backup/<date>/<database>.dump` once complete.
+3. Checks each database. In S3 mode the upload must succeed and the S3 object size must equal the bytes the plugin wrote. On any failure the S3 object is deleted and any open multipart upload is aborted (local mode: the partial file is deleted). Nothing is kept for a retry. Each call is limited to `BACKUP_DB_TIMEOUT` seconds (default 6 hours).
+4. Applies the retention policy, **only if every database succeeded**. Otherwise it logs `Retention skipped: backup failed, nothing deleted` and exits non-zero, so a bad night never removes good backups.
 
-Disk note: the plugin writes the dump on the server first, so `data-backup` needs room for one full set of dumps even in S3 mode. They are deleted as soon as each upload is verified.
+Disk note: S3 mode uses no local disk at all. Local mode needs room for one full set of dumps per kept date.
 
 Trigger it by hand with:
 
@@ -183,6 +186,7 @@ HOST_BACKUP_DIR=/data/coolify/applications/<app-id>/data-backup
 | `HOST_DATA_DIR`         | Absolute host path to `neo4j/data` directory  | For restore   |
 | `HOST_BACKUP_DIR`       | Absolute host path to `data-backup` directory | For backups   |
 | `BACKUP_RETENTION`      | Which backups to keep, e.g. `daily=7,weekly=4,monthly=12` (see [Retention Policy](#retention-policy)) | No, has default |
+| `BACKUP_DB_TIMEOUT`     | Max seconds for one database's backup (default `21600`, 6 hours) | No            |
 | `S3_BUCKET`             | S3 bucket name                                | For S3 upload |
 | `S3_ENDPOINT`           | S3-compatible endpoint URL                    | For S3 upload |
 | `AWS_ACCESS_KEY_ID`     | S3 access key                                 | For S3 upload |
@@ -208,36 +212,45 @@ DozerDB is Neo4j Community Edition, which has no online backup of its own. The [
 
 The backup runs daily at **2:00 AM** (server timezone) and follows this sequence:
 
-1. **Back up** every database with `CALL backup.all()`, which writes one `.dump` per database into `data-backup/` while Neo4j keeps serving queries
-2. **Check** every returned row is `ok`; anything else is logged as a failure
-3. **File** each dump by date locally, or **upload** it to S3 and delete the local copy once the upload is verified
-4. **Apply** retention policy (local and S3)
+1. **List** the databases with `SHOW DATABASES`; any that is not online is a failure
+2. **Back up** each online database with `CALL backup.databaseTo(...)` while Neo4j keeps serving queries: streamed straight to S3 through a FIFO (no local copy), or filed by date locally
+3. **Check** each one; a failed or size-mismatched upload is deleted from S3
+4. **Apply** retention policy (local or S3), only when every database succeeded
 
 A safety watchdog still runs every 5 minutes and restarts Neo4j if it is ever found stopped.
 
 ### Retention Policy
 
-Which dated backups to keep is set by one variable, `BACKUP_RETENTION`, applied the same way to local date folders and to S3 date prefixes. It is a comma-separated list of rules:
+Which dated backups to keep is set by one variable, `BACKUP_RETENTION`, applied the same way to local date folders and to S3 date prefixes. It is a comma-separated list of rules. Each rule is a calendar window counted back from today, today included:
 
 | Rule | Keeps |
 | --- | --- |
-| `last=N` | the N newest backups |
-| `daily=N` | the newest backup of each of the last N days that have one |
-| `weekly=N` | the newest backup of each of the last N weeks (Monday to Sunday) |
-| `monthly=N` | the newest backup of each of the last N calendar months |
-| `yearly=N` | the newest backup of each of the last N calendar years |
+| `last=N` | the N newest backups, however old |
+| `daily=N` | every backup from the last N calendar days |
+| `weekly=N` | the newest backup in each of the last N calendar weeks (Monday to Sunday), the current week included |
+| `monthly=N` | the newest backup in each of the last N calendar months, the current month included |
+| `yearly=N` | the newest backup in each of the last N calendar years, the current year included |
 
-The rules follow the convention of borg, restic and Proxmox Backup Server. They apply in the order above. A backup already kept by an earlier rule still marks its week or month as covered but does not count towards the later rule, so `daily=7,weekly=4` keeps 7 days and then 4 *older* weeks. Days, weeks or months with no backup are skipped, so a few failed nights never shrink what you keep. Everything not kept by any rule is deleted.
+A backup kept by any rule survives; everything else is deleted. Windows are calendar time, not "N backups": with `daily=14` on 2026-10-07 the window is 2026-09-24 to 2026-10-07, and an older backup is deleted even if some days in the window have none.
+
+Only **complete** backups count. A date is complete when it holds `<database>.dump` for every database Neo4j currently has (the `SHOW DATABASES` list). An incomplete date, for example one where a database failed, never counts towards any rule and is always deleted.
+
+Safety rules:
+
+- Retention runs only after a backup where every database succeeded.
+- If the policy would leave no complete backup at all, nothing is deleted and the step fails.
+- If the database list cannot be read (Neo4j unreachable), nothing is deleted and the step fails.
+- An empty, unparsable or all-zero policy stops the step with an error and deletes nothing.
 
 Examples:
 
 ```env
-BACKUP_RETENTION=daily=14                              # one per day for the last 14 days
-BACKUP_RETENTION=daily=7,weekly=4                      # a week of dailies, then a month of weeklies
+BACKUP_RETENTION=daily=14                              # everything from the last 14 days
+BACKUP_RETENTION=daily=7,weekly=4                      # the last 7 days, plus one per week for the last 4 weeks
 BACKUP_RETENTION=daily=7,weekly=4,monthly=12,yearly=2  # full GFS, two years deep
 ```
 
-The default when the variable is unset is `daily=7,weekly=4,monthly=12`. An empty, unparsable or all-zero policy stops the retention step with an error and deletes nothing.
+The default when the variable is unset is `daily=7,weekly=4,monthly=12`.
 
 ### S3 Provider Examples
 
@@ -273,12 +286,11 @@ AWS_DEFAULT_REGION=us-east-1
 
 The backup service chooses a mode automatically from your S3 configuration:
 
-- **S3 mode** — when both `S3_BUCKET` and `S3_ENDPOINT` are set. Each dump written by the
-  plugin is uploaded with `aws s3 cp`, the S3 object size is compared with the local file,
-  and the local file is deleted only after that check passes. A failed or truncated upload
-  is deleted from S3, the dump is kept under `data-backup/<date>/` and retried by the next
-  run, and the previous day's backup is left untouched. Any pre-existing local date folders
-  are uploaded to S3 and then removed, so the local disk does not fill up.
+- **S3 mode** — when both `S3_BUCKET` and `S3_ENDPOINT` are set. Each dump is streamed
+  from the plugin through a FIFO into `aws s3 cp -`: no local copy is ever written. The S3
+  object size is compared with the bytes the plugin wrote. A failed or truncated upload is
+  deleted from S3 (open multipart uploads are aborted), nothing is kept locally for a retry,
+  and the previous days' backups are left untouched because retention does not run.
 - **Local mode** — when S3 is not configured. Dumps are written to `HOST_BACKUP_DIR` and
   pruned by the [retention policy](#retention-policy).
 
@@ -306,12 +318,12 @@ aws s3 cp "s3://${S3_BUCKET}/$(date +%F)/neo4j.dump" - --endpoint-url "${S3_ENDP
   | docker run --rm -i neo4j/neo4j-admin:5.26-community-bullseye \
       neo4j-admin database load neo4j --from-stdin --info
 
-# Confirm the local copy was removed after the verified upload:
+# Confirm nothing was written locally:
 ls -la "${HOST_BACKUP_DIR}" 2>/dev/null
 ```
 
-Expected: the object is listed and non-empty; `--info` prints a valid file count, byte
-count, and format; and no `.dump` file is left under `HOST_BACKUP_DIR`.
+Expected: one object per database, non-empty; `--info` prints a valid file count, byte
+count, and format; and no `.dump`, `.partial-*` or `.stream-*` file under `HOST_BACKUP_DIR`.
 
 ## Manual Operations
 
@@ -387,8 +399,22 @@ docker compose exec neo4j cypher-shell -u neo4j -p <password> "RETURN gds.versio
 
 ### Backup fails for a specific database
 
-`backup.all()` reports a `failed: <reason>` or `skipped: not available` row for that database. The script continues with the others, logs the row as `FAILED`, and exits non-zero. Check logs:
+The job logs one line per database, `OK: <database> (<bytes> bytes ...)` or `FAILED: <database> (<reason>)`. A database that is not online, a failed `backup.databaseTo` call, a failed upload or a size mismatch are all failures. The script continues with the others, then exits non-zero. Check logs:
 
 ```bash
 docker compose logs neo4j-backup --since 24h | grep FAILED
 ```
+
+A failed database's S3 object is deleted, so its date stays incomplete and the next retention run removes it.
+
+### `Retention skipped: backup failed, nothing deleted`
+
+At least one database failed, so retention did not run and no backup was deleted. Fix the failure (see above); the next fully successful run applies retention again, including removing the incomplete date.
+
+### Retention fails with "would leave no complete backup"
+
+No complete backup falls inside any window of `BACKUP_RETENTION`, for example after a long run of failed nights with `daily=N` only. Nothing was deleted. Add a `last=N` rule, or fix the backups so a complete date exists inside the window.
+
+### Old dumps left in `data-backup/` (S3 mode)
+
+Earlier versions wrote dumps to `data-backup/` before uploading and kept them there when an upload failed. The current job never reads or deletes them in S3 mode. Once S3 holds a complete recent backup, delete them by hand (`data-backup/<date>/` folders and loose `*.dump` files).

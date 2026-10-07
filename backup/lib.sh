@@ -1,7 +1,8 @@
 #!/bin/bash
 # Shared library for Neo4j backup/restore scripts.
 # Sourced by backup.sh, retention.sh, restore.sh. Functions that use pipelines save and restore `pipefail` around their pipelines.
-# NEO4J_ADMIN_IMAGE and DATA_DIR are used by restore (load); backups themselves come from the hot backup plugin.
+# NEO4J_ADMIN_IMAGE is used by restore (load); backups themselves come from the hot backup plugin.
+# DATA_DIR is the Neo4j data dir, mounted read-only (used to estimate dump sizes).
 
 NEO4J_ADMIN_IMAGE="${NEO4J_ADMIN_IMAGE:-neo4j/neo4j-admin:5.26-community-bullseye}"
 DATA_DIR="${DATA_DIR:-/data}"
@@ -21,15 +22,16 @@ write_backup_env_file() {
 }
 
 # ---------------------------------------------------------------------------
-# Retention policy (BACKUP_RETENTION), GFS counts in the borg / restic sense:
-#   last=N      keep the N newest backups
-#   daily=N     keep the newest backup of each of the last N days that have one
-#   weekly=N    same per week (Monday to Sunday)
-#   monthly=N   same per calendar month
-#   yearly=N    same per calendar year
-# Rules apply in that order. A backup kept by an earlier rule still occupies its
-# period for later rules but does not count towards their N. Periods without a
-# backup are skipped. Backups are identified by their YYYY-MM-DD date.
+# Retention policy (BACKUP_RETENTION). Rules are calendar windows counted back from
+# today, today included, applied to COMPLETE backup dates only:
+#   last=N      the N newest complete dates
+#   daily=N     every complete date within the last N calendar days
+#   weekly=N    the newest complete date in each of the last N calendar weeks (Monday to Sunday)
+#   monthly=N   the newest complete date in each of the last N calendar months
+#   yearly=N    the newest complete date in each of the last N calendar years
+# A date kept by any rule survives; everything else is deleted. A date is complete when it
+# holds <db>.dump for every database in the current database list; incomplete dates never
+# count and are always deleted. Backups are identified by their YYYY-MM-DD date.
 # ---------------------------------------------------------------------------
 RETENTION_DEFAULT="daily=7,weekly=4,monthly=12"
 
@@ -47,14 +49,18 @@ date_to_days() {
   echo $(( era * 146097 + doe - 719468 ))
 }
 
-# Period key of <date> under <rule>. Weeks are Monday-based indexes since 1969-12-29.
-retention_bucket() {
-  local rule="$1" date="$2"
+# Calendar period index of <date> under <rule>: consecutive periods have consecutive
+# indexes, so "today's index minus this index" is how many periods ago it is.
+# Weeks are Monday-based (1969-12-29 was a Monday).
+retention_period() {
+  local rule="$1" date="$2" y m
+  y=$((10#${date%%-*}))
+  m=${date#*-}; m=$((10#${m%%-*}))
   case "${rule}" in
-    last|daily) echo "${date}" ;;
-    weekly) echo "w$(( ($(date_to_days "${date}") + 3) / 7 ))" ;;
-    monthly) echo "${date%-*}" ;;
-    yearly) echo "${date%%-*}" ;;
+    daily) date_to_days "${date}" ;;
+    weekly) echo $(( ($(date_to_days "${date}") + 3) / 7 )) ;;
+    monthly) echo $(( y * 12 + m - 1 )) ;;
+    yearly) echo "${y}" ;;
   esac
 }
 
@@ -91,30 +97,123 @@ retention_count() {
   echo 0
 }
 
-# From the YYYY-MM-DD dates given as arguments, echo "<date> <rule>" for every date the
-# policy keeps. Anything not echoed is to be deleted. rc 1 (and no output) on a bad policy.
+# retention_keep_dates <spec> <today> <complete dates...>
+# Echo "<date> <rule>" for every complete date the policy keeps (first rule that keeps it).
+# Anything not echoed is to be deleted. Pass only COMPLETE dates. rc 1 (no output) on a bad policy.
 retention_keep_dates() {
-  local spec="$1"; shift
+  local spec="$1" today="$2"; shift 2
   retention_validate "${spec}" || return 1
   local dates
   dates=$(printf '%s\n' "$@" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort -r -u)
-  local kept=" " rule n d bucket last count
+  local kept=" " rule n d period now last count
   for rule in last daily weekly monthly yearly; do
     n=$(retention_count "${spec}" "${rule}")
     [ "${n}" -gt 0 ] || continue
     last=""; count=0
+    [ "${rule}" = last ] || now=$(retention_period "${rule}" "${today}")
     for d in ${dates}; do
-      bucket=$(retention_bucket "${rule}" "${d}")
-      [ "${bucket}" != "${last}" ] || continue
-      last="${bucket}"
+      if [ "${rule}" = last ]; then
+        [ "${count}" -lt "${n}" ] || break
+        count=$((count + 1))
+      else
+        period=$(retention_period "${rule}" "${d}")
+        # Dates are newest first: once a period falls outside the window, so do the rest.
+        # A date after today (clock skew) counts as inside the window.
+        [ $(( now - period )) -lt "${n}" ] || break
+        [ "${period}" != "${last}" ] || continue   # only the newest date of each period
+        last="${period}"
+      fi
       case "${kept}" in *" ${d} "*) continue ;; esac
       kept="${kept}${d} "
       echo "${d} ${rule}"
-      count=$((count + 1))
-      [ "${count}" -lt "${n}" ] || break
     done
   done
   return 0
+}
+
+# missing_databases "<dump names present>" "<databases>": echo (space separated) every
+# database without a <db>.dump in the first list. Empty output = the date is complete.
+missing_databases() {
+  local present=" $1 " db missing=""
+  for db in $2; do
+    case "${present}" in *" ${db}.dump "*) ;; *) missing="${missing}${missing:+ }${db}" ;; esac
+  done
+  echo "${missing}"
+}
+
+# ---------------------------------------------------------------------------
+# Talking to Neo4j (cypher-shell inside the Neo4j container)
+# ---------------------------------------------------------------------------
+
+# Echo the Neo4j container name: BACKUP_NEO4J_CONTAINER, else a running container whose
+# name starts with the service name and is not the backup container, else the Compose default.
+resolve_neo4j_container() {
+  local service="${NEO4J_SERVICE:-neo4j}" name
+  if [ -n "${BACKUP_NEO4J_CONTAINER:-}" ]; then echo "${BACKUP_NEO4J_CONTAINER}"; return 0; fi
+  name=$(docker ps --format '{{.Names}}' 2>/dev/null | grep "^${service}" | grep -v backup | head -1) || true
+  echo "${name:-${COMPOSE_PROJECT:-neo4j}-${service}-1}"
+}
+
+# cypher_rows <container> <database> <query>: run a query that returns one string column
+# and echo its values, one per line, header and quotes stripped. rc 1 if cypher-shell fails
+# (its output then goes to stderr).
+# With CYPHER_TIMEOUT set (seconds), the call is killed after that long (busybox/coreutils `timeout`).
+cypher_rows() {
+  local container="$1" database="$2" query="$3" out rc=0
+  if [ -n "${CYPHER_TIMEOUT:-}" ]; then
+    out=$(timeout "${CYPHER_TIMEOUT}" docker exec "${container}" cypher-shell -u "${NEO4J_AUTH%%/*}" -p "${NEO4J_AUTH#*/}" \
+          -d "${database}" --format plain "${query}" 2>&1) || rc=$?
+  else
+    out=$(docker exec "${container}" cypher-shell -u "${NEO4J_AUTH%%/*}" -p "${NEO4J_AUTH#*/}" \
+          -d "${database}" --format plain "${query}" 2>&1) || rc=$?
+  fi
+  if [ "${rc}" -ne 0 ]; then
+    [ "${rc}" -ne 124 ] && [ "${rc}" -ne 143 ] || out="timed out after ${CYPHER_TIMEOUT}s. ${out}"
+    echo "${out}" >&2
+    return 1
+  fi
+  printf '%s\n' "${out}" | tail -n +2 | sed -e 's/^"//' -e 's/"$//' | grep -v '^$' || true
+}
+
+# database_status_rows <container>: echo "<name>|<currentStatus>" for every database.
+database_status_rows() {
+  local rows
+  rows=$(cypher_rows "$1" system \
+    "SHOW DATABASES YIELD name, currentStatus RETURN name + '|' + currentStatus AS row") || return 1
+  printf '%s\n' "${rows}" | awk -F'|' 'NF >= 2 && !seen[$1]++'
+}
+
+# load_database_list: fill DB_ROWS ("<name>|<status>" lines) from NEO4J_CONTAINER, falling
+# back to the Compose v1 container name (and updating NEO4J_CONTAINER) if that fails.
+# rc 1 with the reason in DB_LIST_ERROR when the list cannot be obtained or is empty.
+load_database_list() {
+  local err alt out
+  DB_ROWS=""; DB_LIST_ERROR=""
+  err=$(mktemp "${TMPDIR:-/tmp}/dblist.XXXXXX")
+  if out=$(database_status_rows "${NEO4J_CONTAINER}" 2>"${err}") && [ -n "${out}" ]; then
+    DB_ROWS="${out}"; rm -f "${err}"; return 0
+  fi
+  alt="${COMPOSE_PROJECT:-neo4j}_${NEO4J_SERVICE:-neo4j}_1"
+  if out=$(database_status_rows "${alt}" 2>/dev/null) && [ -n "${out}" ]; then
+    NEO4J_CONTAINER="${alt}"; DB_ROWS="${out}"; rm -f "${err}"; return 0
+  fi
+  DB_LIST_ERROR=$(cat "${err}")
+  [ -n "${DB_LIST_ERROR}" ] || DB_LIST_ERROR="SHOW DATABASES returned no databases"
+  rm -f "${err}"
+  return 1
+}
+
+# Estimate the dump size of <db> in bytes from its store under the read-only /data mount
+# (databases/<db> + transactions/<db>). Used as `aws s3 cp --expected-size`, without which
+# a stdin upload is capped far below a large dump. Over-estimating is safe. Uses `du -sk`
+# (portable across busybox and BSD/macOS). Echoes 0 + rc 1 when the store is not visible.
+estimate_dump_size() {
+  [ -n "${1:-}" ] || { echo 0; return 1; }
+  local db="$1" kb tx
+  kb=$(du -sk "${DATA_DIR}/databases/${db}" 2>/dev/null | cut -f1)
+  if [ -z "${kb}" ]; then echo 0; return 1; fi
+  tx=$(du -sk "${DATA_DIR}/transactions/${db}" 2>/dev/null | cut -f1)
+  echo $(( (kb + ${tx:-0}) * 1024 ))
 }
 
 # True when S3-compatible storage is configured. Connection logic is unchanged.
@@ -129,43 +228,17 @@ s3_object_size() {
     | awk '{print $3}' | head -1
 }
 
-# Upload a finished dump file to S3 as <date>/<db>.dump and verify it landed with the same
-# size. rc 0 = uploaded and verified; rc 1 = failure (partial object removed, local file untouched).
-upload_dump_to_s3() {
-  local file="$1" db="$2" date="$3"
-  local key="${date}/${db}.dump"
-  local local_size remote_size
-  local_size=$(wc -c < "${file}" | tr -d '[:space:]')
-  if aws s3 cp "${file}" "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --no-progress; then
-    remote_size=$(s3_object_size "${key}")
-    if [ -n "${remote_size}" ] && [ "${remote_size}" = "${local_size}" ]; then
-      return 0
-    fi
-  fi
-  aws s3 rm "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --quiet 2>/dev/null || true
-  return 1
-}
-
-# In S3 mode, push any pre-existing local date dirs to S3, verify, then delete them.
-# Unverified dirs are kept and retried on the next run. Clears the local-disk backlog.
-drain_local_backlog() {
-  local dir date local_count remote_count
-  for dir in "${BACKUP_ROOT}"/????-??-??; do
-    [ -d "${dir}" ] || continue
-    date=$(basename "${dir}")
-    local_count=$(find "${dir}" -type f ! -name '.*' 2>/dev/null | wc -l | tr -d '[:space:]')
-    if [ -z "${local_count}" ] || [ "${local_count}" -eq 0 ]; then
-      rmdir "${dir}" 2>/dev/null || true
-      continue
-    fi
-    if aws s3 cp "${dir}/" "s3://${S3_BUCKET}/${date}/" \
-         --recursive --endpoint-url "${S3_ENDPOINT}" --no-progress 2>/dev/null; then
-      remote_count=$(aws s3 ls "s3://${S3_BUCKET}/${date}/" \
-         --recursive --endpoint-url "${S3_ENDPOINT}" 2>/dev/null | grep -c .) || remote_count=0
-      if [ "${remote_count:-0}" -ge "${local_count}" ]; then
-        rm -rf "${dir}"
-      fi
-    fi
+# Remove <key> from S3 and abort any multipart upload left open for it, so a failed
+# stream leaves nothing behind (no half object, no billed orphan parts).
+discard_s3_object() {
+  local key="$1" ids id
+  aws s3 rm "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --quiet >/dev/null 2>&1 || true
+  ids=$(aws s3api list-multipart-uploads --bucket "${S3_BUCKET}" --prefix "${key}" \
+          --endpoint-url "${S3_ENDPOINT}" --query "Uploads[?Key=='${key}'].UploadId" --output text 2>/dev/null) || ids=""
+  for id in ${ids}; do
+    [ "${id}" != "None" ] || continue
+    aws s3api abort-multipart-upload --bucket "${S3_BUCKET}" --key "${key}" --upload-id "${id}" \
+      --endpoint-url "${S3_ENDPOINT}" >/dev/null 2>&1 || true
   done
 }
 

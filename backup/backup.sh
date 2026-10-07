@@ -2,9 +2,12 @@
 set -euo pipefail
 
 # Nightly backup through the hot backup plugin: Neo4j keeps running.
-# The plugin's backup.all() writes one .dump per database into /var/lib/neo4j/backups
-# inside the Neo4j container, which is the same host folder mounted here as /backups.
-# This script then files each dump by date (local mode) or uploads it to S3 (S3 mode).
+# For each database, backup.databaseTo(name, fileName) writes the dump to
+# /var/lib/neo4j/backups/<fileName> inside the Neo4j container, which is the same host
+# folder mounted here as /backups.
+#   S3 mode:    <fileName> is a FIFO; `aws s3 cp -` reads it and streams to S3. Zero local disk.
+#   Local mode: <fileName> is a partial file, moved to /backups/<date>/<db>.dump when complete.
+# Retention runs only when every database succeeded.
 
 # Source environment variables (cron does not inherit them)
 if [ -f /etc/environment.backup ]; then
@@ -22,21 +25,15 @@ TODAY=$(date +%Y-%m-%d)
 LOG_PREFIX="[backup][${TODAY}]"
 COMPOSE_PROJECT="${COMPOSE_PROJECT:-neo4j}"
 NEO4J_SERVICE="${NEO4J_SERVICE:-neo4j}"
-if [ -n "${BACKUP_NEO4J_CONTAINER:-}" ]; then
-  CONTAINER="${BACKUP_NEO4J_CONTAINER}"
-else
-  # Auto-discover: find a running container whose name starts with the service
-  # name but is NOT the backup container
-  CONTAINER=$(docker ps --format '{{.Names}}' | grep "^${NEO4J_SERVICE}" | grep -v backup | head -1)
-  if [ -z "${CONTAINER}" ]; then
-    CONTAINER="${COMPOSE_PROJECT}-${NEO4J_SERVICE}-1"
-  fi
-fi
+NEO4J_CONTAINER=$(resolve_neo4j_container)
 BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 HOST_BACKUP_DIR="${HOST_BACKUP_DIR:-}"
 S3_BUCKET="${S3_BUCKET:-}"
 S3_ENDPOINT="${S3_ENDPOINT:-}"
 NEO4J_AUTH="${NEO4J_AUTH:-}"
+DATA_DIR="${DATA_DIR:-/data}"
+# Upper bound in seconds for one database's backup.databaseTo call (default 6 h, enough for ~100 GB).
+BACKUP_DB_TIMEOUT="${BACKUP_DB_TIMEOUT:-21600}"
 DUMP_FAILED=0
 
 log() { echo "${LOG_PREFIX} $(date +%H:%M:%S) $*"; }
@@ -57,77 +54,163 @@ if [ ! -d "${BACKUP_ROOT}" ]; then
   exit 1
 fi
 
-NEO4J_USER="${NEO4J_AUTH%%/*}"
-NEO4J_PASSWORD="${NEO4J_AUTH#*/}"
-
 log "=== Starting hot backup (Neo4j stays online) ==="
 if s3_configured; then log "S3 configured: dumps go to s3://${S3_BUCKET}/${TODAY}/"; else log "Local mode: dumps go to ${BACKUP_ROOT}/${TODAY}/"; fi
 
-# --- Phase 1: Run backup.all() inside the Neo4j container ---
-# One row per database: "database|path|bytes|status". Any status other than "ok" is a failure.
-BACKUP_QUERY="CALL backup.all() YIELD database, path, bytes, status RETURN database + '|' + coalesce(path, '') + '|' + coalesce(toString(bytes), '') + '|' + status AS row"
+# Never leave a FIFO or a background upload behind, whatever happens.
+STREAM_PIDS=""
+cleanup_streams() {
+  local pid
+  for pid in ${STREAM_PIDS}; do kill "${pid}" 2>/dev/null || true; done
+  rm -f "${BACKUP_ROOT}"/.stream-*.fifo 2>/dev/null || true
+}
+trap cleanup_streams EXIT
+trap 'exit 130' INT TERM
 
-run_backup_all() {
-  docker exec "$1" cypher-shell -u "${NEO4J_USER}" -p "${NEO4J_PASSWORD}" -d neo4j --format plain "${BACKUP_QUERY}"
+# --- Phase 1: List databases ---
+if ! load_database_list; then
+  log "ERROR: could not list databases in ${NEO4J_CONTAINER}: ${DB_LIST_ERROR}"
+  exit 1
+fi
+DATABASES=""
+ONLINE=""
+while IFS='|' read -r db status; do
+  [ -n "${db}" ] || continue
+  DATABASES="${DATABASES}${DATABASES:+ }${db}"
+  if [ "${status}" = "online" ]; then
+    ONLINE="${ONLINE}${ONLINE:+ }${db}"
+  else
+    log "  FAILED: ${db} (not online: ${status})"
+    DUMP_FAILED=1
+  fi
+done <<< "${DB_ROWS}"
+log "Databases: ${DATABASES}"
+
+# run_database_to <db> <fileName>: call the plugin, killed after BACKUP_DB_TIMEOUT seconds.
+# On success sets DUMP_BYTES; on failure sets FAIL_REASON. rc 0/1.
+run_database_to() {
+  local db="$1" file="$2" out row status
+  DUMP_BYTES=""; FAIL_REASON=""
+  if ! out=$(CYPHER_TIMEOUT="${BACKUP_DB_TIMEOUT}" cypher_rows "${NEO4J_CONTAINER}" neo4j \
+      "CALL backup.databaseTo('${db}', '${file}') YIELD database, path, bytes, millis, status RETURN status + '|' + toString(bytes) AS row" 2>&1); then
+    FAIL_REASON="backup.databaseTo failed: $(printf '%s' "${out}" | tr '\n' ' ')"
+    return 1
+  fi
+  row=$(printf '%s\n' "${out}" | tail -1)
+  status="${row%%|*}"; DUMP_BYTES="${row#*|}"
+  if [ "${status}" != "ok" ]; then FAIL_REASON="status: ${status}"; return 1; fi
+  case "${DUMP_BYTES}" in ''|*[!0-9]*) FAIL_REASON="unexpected procedure output: ${out}"; return 1 ;; esac
+  return 0
 }
 
-log "Running backup.all() in ${CONTAINER}..."
-if ! ROWS=$(run_backup_all "${CONTAINER}" 2>&1); then
-  # Try underscore naming convention (Compose v1)
-  ALT_CONTAINER="${COMPOSE_PROJECT}_${NEO4J_SERVICE}_1"
-  log "Trying alternative container name: ${ALT_CONTAINER}"
-  if ! ROWS=$(run_backup_all "${ALT_CONTAINER}" 2>&1); then
-    log "ERROR: backup.all() failed: ${ROWS}"
-    exit 1
-  fi
-  CONTAINER="${ALT_CONTAINER}"
-fi
+# stream_to_s3 <db>: dump <db> through a FIFO straight into S3 as <today>/<db>.dump.
+# Nothing touches the local disk. On any failure the S3 object and any open multipart
+# upload are removed. Sets DUMP_BYTES / FAIL_REASON. rc 0/1.
+stream_to_s3() {
+  local db="$1"
+  local name=".stream-${db}.fifo"
+  local fifo="${BACKUP_ROOT}/${name}" key="${TODAY}/${db}.dump"
+  local est aws_pid aws_rc=0 remote
+  DUMP_BYTES=""; FAIL_REASON=""
 
-# --- Phase 2: File or upload each dump ---
-COUNT=0
-while IFS='|' read -r db path bytes status; do
-  [ -n "${db}" ] || continue
-  COUNT=$((COUNT + 1))
-
-  if [ "${status}" != "ok" ]; then
-    log "  FAILED: ${db} (${status})"
-    DUMP_FAILED=1
-    continue
+  est=$(estimate_dump_size "${db}") || true
+  if ! [ "${est}" -gt 0 ] 2>/dev/null; then
+    FAIL_REASON="cannot estimate its size: ${DATA_DIR}/databases/${db} is not visible (is the Neo4j data dir mounted at ${DATA_DIR}?)"
+    return 1
   fi
 
-  file="${BACKUP_ROOT}/$(basename "${path}")"
-  if [ ! -f "${file}" ]; then
-    log "  FAILED: ${db}: plugin wrote ${path} but it is not visible at ${file}. Is ./data-backup mounted at /var/lib/neo4j/backups on the neo4j service?"
-    DUMP_FAILED=1
-    continue
+  rm -f "${fifo}"
+  if ! mkfifo "${fifo}" || ! chmod 666 "${fifo}"; then
+    FAIL_REASON="cannot create ${fifo}"
+    rm -f "${fifo}"
+    return 1
   fi
 
-  if s3_configured; then
-    if upload_dump_to_s3 "${file}" "${db}" "${TODAY}"; then
-      rm -f "${file}"
-      log "  OK: ${db} (${bytes} bytes, uploaded)"
+  aws s3 cp - "s3://${S3_BUCKET}/${key}" --endpoint-url "${S3_ENDPOINT}" --no-progress \
+    --expected-size "${est}" < "${fifo}" &
+  aws_pid=$!
+  STREAM_PIDS="${aws_pid}"
+
+  if run_database_to "${db}" "${name}"; then
+    wait "${aws_pid}" || aws_rc=$?
+    STREAM_PIDS=""
+    rm -f "${fifo}"
+    if [ "${aws_rc}" -ne 0 ]; then
+      FAIL_REASON="upload failed (aws exit ${aws_rc})"
     else
-      # Keep the dump locally under today's date; retention.sh drains it to S3 on the next run.
-      mkdir -p "${BACKUP_ROOT}/${TODAY}"
-      mv -f "${file}" "${BACKUP_ROOT}/${TODAY}/${db}.dump"
-      log "  FAILED: ${db}: upload failed, dump kept at ${BACKUP_ROOT}/${TODAY}/${db}.dump for retry"
+      remote=$(s3_object_size "${key}")
+      if [ "${remote}" != "${DUMP_BYTES}" ]; then
+        FAIL_REASON="size mismatch: dump ${DUMP_BYTES} bytes, S3 object ${remote:-missing}"
+      fi
+    fi
+  else
+    # aws is either still blocked opening the FIFO (the plugin never opened it) or reading
+    # a stream that is no longer wanted (the call failed or timed out while the server may
+    # still be writing). Waiting could hang in both cases, so stop it; the object and any
+    # multipart upload are discarded below.
+    kill "${aws_pid}" 2>/dev/null || true
+    wait "${aws_pid}" 2>/dev/null || true
+    STREAM_PIDS=""
+    rm -f "${fifo}"
+  fi
+
+  if [ -n "${FAIL_REASON}" ]; then
+    discard_s3_object "${key}"
+    return 1
+  fi
+  return 0
+}
+
+# save_locally <db>: dump <db> to a partial file, then move it to <today>/<db>.dump.
+save_locally() {
+  local db="$1"
+  local name=".partial-${db}.dump"
+  local partial="${BACKUP_ROOT}/${name}"
+  rm -f "${partial}"
+  if ! run_database_to "${db}" "${name}"; then
+    rm -f "${partial}"
+    return 1
+  fi
+  if [ ! -f "${partial}" ]; then
+    FAIL_REASON="plugin wrote ${name} but it is not visible at ${partial}. Is ./data-backup mounted at /var/lib/neo4j/backups on the neo4j service?"
+    return 1
+  fi
+  mkdir -p "${BACKUP_ROOT}/${TODAY}"
+  mv -f "${partial}" "${BACKUP_ROOT}/${TODAY}/${db}.dump"
+}
+
+# --- Phase 2: Back up each online database ---
+for db in ${ONLINE}; do
+  log "Backing up ${db}..."
+  if s3_configured; then
+    if stream_to_s3 "${db}"; then
+      log "  OK: ${db} (${DUMP_BYTES} bytes, streamed to s3://${S3_BUCKET}/${TODAY}/${db}.dump)"
+    else
+      log "  FAILED: ${db} (${FAIL_REASON})"
       DUMP_FAILED=1
     fi
   else
-    mkdir -p "${BACKUP_ROOT}/${TODAY}"
-    mv -f "${file}" "${BACKUP_ROOT}/${TODAY}/${db}.dump"
-    log "  OK: ${db} (${bytes} bytes)"
+    if save_locally "${db}"; then
+      log "  OK: ${db} (${DUMP_BYTES} bytes)"
+    else
+      log "  FAILED: ${db} (${FAIL_REASON})"
+      DUMP_FAILED=1
+    fi
   fi
-done < <(printf '%s\n' "${ROWS}" | tail -n +2 | sed -e 's/^"//' -e 's/"$//')
+done
 
-if [ "${COUNT}" -eq 0 ]; then
-  log "ERROR: backup.all() returned no databases. Output was: ${ROWS}"
+# --- Phase 3: Apply retention, only after a fully successful backup ---
+if [ "${DUMP_FAILED}" -ne 0 ]; then
+  log "Retention skipped: backup failed, nothing deleted"
+  log "=== Backup finished with failures ==="
   exit 1
 fi
-log "Processed ${COUNT} databases."
 
-# --- Phase 3: Apply retention ---
-"${RETENTION_SCRIPT:-${LIB_DIR}/retention.sh}"
+export BACKUP_DATABASES="${DATABASES}"
+if ! "${RETENTION_SCRIPT:-${LIB_DIR}/retention.sh}"; then
+  log "ERROR: retention failed (see above)"
+  exit 1
+fi
 
-log "=== Backup complete (failures: ${DUMP_FAILED}) ==="
-exit ${DUMP_FAILED}
+log "=== Backup complete ==="
+exit 0
